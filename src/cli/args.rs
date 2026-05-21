@@ -116,4 +116,22 @@ pub enum Commands {
         #[arg(long)]
         at: Option<u64>,
     },
+
+    /// Manage configuration and telemetry
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ConfigAction {
+    /// Show current configuration
+    Show,
+    /// Show config file path
+    Path,
+    /// Show collected performance metrics
+    Metrics,
+    /// Set a config value (e.g., 'set telemetry true')
+    Set { key: String, value: String },
 }
