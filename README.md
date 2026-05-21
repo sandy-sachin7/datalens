@@ -275,17 +275,6 @@ $DELTALENS_CONFIG_DIR/config.json  # override
 
 ---
 
-## Project status
-
-Active development. The transaction log API is stable through v0.2.x. Breaking changes will be noted in release notes.
-
-**Roadmap:**
-- `deltalens suggest <path>` — actionable recommendations (v0.3)
-- Remote storage: S3, GCS, Azure Blob (v0.4)
-- Checkpoint-based fast start for tables with 10K+ commits
-
----
-
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). All participants must follow our [Code of Conduct](CODE_OF_CONDUCT.md).
