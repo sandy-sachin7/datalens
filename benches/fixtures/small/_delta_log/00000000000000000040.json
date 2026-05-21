@@ -1,0 +1,11 @@
+{"commitInfo": {"timestamp": 1735813800000, "operation": "WRITE", "operationParameters": {"mode": "Append"}, "engineInfo": "Apache-Spark/3.5.0 Delta-Lake/3.1.0", "isBlindAppend": true, "operationMetrics": {"numFiles": "10", "numOutputRows": "500000", "numOutputBytes": "170000000"}}}
+{"add": {"path": "part-00040-2527e3a7-3f51-4cb9-b6d0-1ebf4899b976.parquet", "size": 17000000, "modificationTime": 1735813800000, "dataChange": true, "partitionValues": {}}}
+{"add": {"path": "part-00040-3eacc274-c440-4562-ab74-3f69010addb6.parquet", "size": 17000000, "modificationTime": 1735813800000, "dataChange": true, "partitionValues": {}}}
+{"add": {"path": "part-00040-1507f167-826a-46c0-b2aa-74a432b73134.parquet", "size": 17000000, "modificationTime": 1735813800000, "dataChange": true, "partitionValues": {}}}
+{"add": {"path": "part-00040-9329b70e-fdf0-432b-9fcc-ad9af88799db.parquet", "size": 17000000, "modificationTime": 1735813800000, "dataChange": true, "partitionValues": {}}}
+{"add": {"path": "part-00040-dc7838b5-c68a-4711-b3c8-bba0b55e9fa2.parquet", "size": 17000000, "modificationTime": 1735813800000, "dataChange": true, "partitionValues": {}}}
+{"add": {"path": "part-00040-b1704c29-68a0-4caf-87b5-d264a71901e3.parquet", "size": 17000000, "modificationTime": 1735813800000, "dataChange": true, "partitionValues": {}}}
+{"add": {"path": "part-00040-e74dfa18-c061-438e-bace-3c36b86568fb.parquet", "size": 17000000, "modificationTime": 1735813800000, "dataChange": true, "partitionValues": {}}}
+{"add": {"path": "part-00040-a6f51083-2655-4c32-b692-4019766f07bd.parquet", "size": 17700000, "modificationTime": 1735813800000, "dataChange": true, "partitionValues": {}}}
+{"add": {"path": "part-00040-b18bfa22-4f35-42cd-8014-4f3203486fc4.parquet", "size": 17000000, "modificationTime": 1735813800000, "dataChange": true, "partitionValues": {}}}
+{"add": {"path": "part-00040-a1f5dd7d-0042-45bc-8860-870caf528b65.parquet", "size": 17000000, "modificationTime": 1735813800000, "dataChange": true, "partitionValues": {}}}
