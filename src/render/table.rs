@@ -5,7 +5,6 @@ use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Cell, Color, Table};
 use std::cmp::Ordering;
-use std::path::Path;
 
 pub struct TableRenderer {
     plain: bool,
@@ -16,7 +15,7 @@ impl TableRenderer {
         Self { plain }
     }
 
-    pub fn render_inspect(&self, path: &Path, stats: &TableStats) {
+    pub fn render_inspect(&self, path: &str, stats: &TableStats) {
         let mut table = Table::new();
         if !self.plain {
             table
@@ -30,7 +29,7 @@ impl TableRenderer {
             } else {
                 Color::Cyan
             }),
-            Cell::new(path.display().to_string()).fg(if self.plain {
+            Cell::new(path.to_string()).fg(if self.plain {
                 Color::Reset
             } else {
                 Color::Cyan
@@ -212,7 +211,7 @@ impl TableRenderer {
 
     pub fn render_diff(
         &self,
-        path: &Path,
+        path: &str,
         diff: &crate::core::analyzer::diff::VersionDiff,
         schema_only: bool,
         files_only: bool,
@@ -234,7 +233,7 @@ impl TableRenderer {
             } else {
                 Color::Cyan
             }),
-            Cell::new(path.display().to_string()).fg(if self.plain {
+            Cell::new(path.to_string()).fg(if self.plain {
                 Color::Reset
             } else {
                 Color::Cyan
@@ -373,7 +372,7 @@ impl TableRenderer {
 
     pub fn render_lineage(
         &self,
-        _path: &Path,
+        _path: &str,
         entries: &[crate::core::model::lineage::LineageEntry],
     ) {
         if entries.is_empty() {
@@ -456,11 +455,7 @@ impl TableRenderer {
         }
     }
 
-    pub fn render_audit(
-        &self,
-        _path: &Path,
-        entries: &[crate::core::model::lineage::LineageEntry],
-    ) {
+    pub fn render_audit(&self, _path: &str, entries: &[crate::core::model::lineage::LineageEntry]) {
         if entries.is_empty() {
             println!("No audit operations found matching the criteria.");
             return;
@@ -545,7 +540,7 @@ impl TableRenderer {
 
     pub fn render_schema_snapshot(
         &self,
-        path: &Path,
+        path: &str,
         snapshot: &crate::core::model::schema::SchemaSnapshot,
     ) {
         let mut table = Table::new();
@@ -561,7 +556,7 @@ impl TableRenderer {
             } else {
                 Color::Cyan
             }),
-            Cell::new(path.display().to_string()).fg(if self.plain {
+            Cell::new(path.to_string()).fg(if self.plain {
                 Color::Reset
             } else {
                 Color::Cyan
@@ -616,7 +611,7 @@ impl TableRenderer {
 
     pub fn render_schema_history(
         &self,
-        path: &Path,
+        path: &str,
         history: &[crate::core::model::schema::SchemaChange],
     ) {
         if history.is_empty() {
@@ -626,15 +621,10 @@ impl TableRenderer {
 
         if !self.plain {
             use colored::Colorize;
-            println!(
-                "{}",
-                format!("Schema Evolution · {}", path.display())
-                    .cyan()
-                    .bold()
-            );
+            println!("{}", format!("Schema Evolution · {}", path).cyan().bold());
             println!();
         } else {
-            println!("Schema Evolution · {}", path.display());
+            println!("Schema Evolution · {}", path);
             println!();
         }
 

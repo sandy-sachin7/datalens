@@ -1,21 +1,22 @@
 use crate::cli::output_opts::OutputOpts;
 use crate::core::analyzer::lineage::{LineageFilter, LineageTracer};
 use crate::core::reader::DeltaLogReader;
+use crate::core::storage::storage_for;
 use crate::error::DeltaLensError;
 use crate::render::json::render_json;
 use crate::render::table::TableRenderer;
 use chrono::{TimeZone, Utc};
-use std::path::Path;
 
 pub fn execute(
-    path: &Path,
+    path_str: &str,
     since: Option<String>,
     until: Option<String>,
     op: Option<String>,
     user: Option<String>,
     opts: OutputOpts,
 ) -> Result<(), DeltaLensError> {
-    let reader = DeltaLogReader::new(path)?;
+    let (storage, root) = storage_for(path_str)?;
+    let reader = DeltaLogReader::new(storage, &root)?;
     let entries = reader.read_all()?;
 
     let lineage_entries = LineageTracer::trace(&entries);
@@ -67,7 +68,7 @@ pub fn execute(
         render_json(&filtered_entries);
     } else {
         let renderer = TableRenderer::new(opts.plain);
-        renderer.render_audit(path, &filtered_entries);
+        renderer.render_audit(path_str, &filtered_entries);
     }
 
     Ok(())

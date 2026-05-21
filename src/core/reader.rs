@@ -1,38 +1,40 @@
 use crate::core::model::action::Action;
 use crate::core::parser::commit::CommitParser;
+use crate::core::storage::StorageBackend;
 use crate::error::DeltaLensError;
 use rayon::prelude::*;
-use std::path::{Path, PathBuf};
 
 /// One version entry: its number, file path, and parsed actions.
 pub struct CommitEntry {
     pub version: u64,
     #[allow(dead_code)]
-    pub path: PathBuf,
+    pub path: String,
     pub actions: Vec<Action>,
 }
 
 /// Entry point for all Delta log reading operations.
 pub struct DeltaLogReader {
     #[allow(dead_code)]
-    pub table_path: PathBuf,
-    pub log_path: PathBuf,
+    pub table_root: String,
+    pub log_subpath: String,
+    pub storage: Box<dyn StorageBackend>,
 }
 
 impl DeltaLogReader {
-    /// Validate and open a Delta table at the given path.
-    pub fn new(table_path: &Path) -> Result<Self, DeltaLensError> {
-        let log_path = table_path.join("_delta_log");
+    /// Create a reader for a Delta table using the given storage backend.
+    /// `table_root` is the root URI/path of the table (e.g. "/data/table" or "s3://bucket/table").
+    pub fn new(storage: Box<dyn StorageBackend>, table_root: &str) -> Result<Self, DeltaLensError> {
+        let log_subpath = "_delta_log".to_string();
 
-        if !log_path.exists() {
-            return Err(DeltaLensError::NotADeltaTable(
-                table_path.to_string_lossy().to_string(),
-            ));
+        // Validate that the log directory exists
+        if !storage.exists(&log_subpath)? {
+            return Err(DeltaLensError::NotADeltaTable(table_root.to_string()));
         }
 
         Ok(Self {
-            table_path: table_path.to_path_buf(),
-            log_path,
+            table_root: table_root.to_string(),
+            log_subpath,
+            storage,
         })
     }
 
@@ -52,11 +54,12 @@ impl DeltaLogReader {
         // Each JSON file is independently parseable — embarrassingly parallel.
         let mut entries: Vec<CommitEntry> = log_files
             .par_iter()
-            .map(|(version, path)| {
-                let actions = CommitParser::parse_file(path)?;
+            .map(|(version, file_path)| {
+                let data = self.storage.read(file_path)?;
+                let actions = CommitParser::parse_bytes(&data, file_path)?;
                 Ok(CommitEntry {
                     version: *version,
-                    path: path.clone(),
+                    path: file_path.clone(),
                     actions,
                 })
             })
@@ -79,11 +82,12 @@ impl DeltaLogReader {
 
         let mut entries: Vec<CommitEntry> = last_n
             .par_iter()
-            .map(|(version, path)| {
-                let actions = CommitParser::parse_file(path)?;
+            .map(|(version, file_path)| {
+                let data = self.storage.read(file_path)?;
+                let actions = CommitParser::parse_bytes(&data, file_path)?;
                 Ok(CommitEntry {
                     version: *version,
-                    path: path.clone(),
+                    path: file_path.clone(),
                     actions,
                 })
             })
@@ -107,23 +111,17 @@ impl DeltaLogReader {
         &self,
         from: Option<u64>,
         to: Option<u64>,
-    ) -> Result<Vec<(u64, PathBuf)>, DeltaLensError> {
+    ) -> Result<Vec<(u64, String)>, DeltaLensError> {
+        let entries = self.storage.list(&self.log_subpath)?;
+
         let mut files = Vec::new();
-
-        for entry in std::fs::read_dir(&self.log_path)? {
-            let entry = entry?;
-            let path = entry.path();
-
+        for path_str in entries {
             // Only JSON commit files — skip .parquet checkpoints and _last_checkpoint
-            if let Some(ext) = path.extension() {
-                if ext != "json" {
-                    continue;
-                }
-            } else {
+            if !path_str.ends_with(".json") {
                 continue;
             }
 
-            if let Some(version) = Self::extract_version(&path) {
+            if let Some(version) = Self::extract_version(&path_str) {
                 let in_range = match (from, to) {
                     (Some(f), Some(t)) => version >= f && version <= t,
                     (Some(f), None) => version >= f,
@@ -132,7 +130,7 @@ impl DeltaLogReader {
                 };
 
                 if in_range {
-                    files.push((version, path));
+                    files.push((version, path_str));
                 }
             }
         }
@@ -142,14 +140,17 @@ impl DeltaLogReader {
     }
 
     /// Extract version number from filename: `0000000000000000142.json` → `142`
-    fn extract_version(path: &Path) -> Option<u64> {
-        path.file_stem()?.to_str()?.parse::<u64>().ok()
+    fn extract_version(path_str: &str) -> Option<u64> {
+        // Handle paths like "/abs/path/00042.json" or "s3://bucket/.../00042.json"
+        let filename = std::path::Path::new(path_str).file_stem()?.to_str()?;
+        filename.parse::<u64>().ok()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::storage::LocalStorage;
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -159,10 +160,18 @@ mod tests {
         writeln!(f, "{}", content).unwrap();
     }
 
+    fn create_reader(tmp: &TempDir) -> DeltaLogReader {
+        let root = tmp.path().to_string_lossy().to_string();
+        let storage = Box::new(LocalStorage::new(root.clone()));
+        DeltaLogReader::new(storage, &root).unwrap()
+    }
+
     #[test]
     fn test_reject_non_delta_path() {
         let tmp = TempDir::new().unwrap();
-        let result = DeltaLogReader::new(tmp.path());
+        let root = tmp.path().to_string_lossy().to_string();
+        let storage = Box::new(LocalStorage::new(root.clone()));
+        let result = DeltaLogReader::new(storage, &root);
         assert!(matches!(result, Err(DeltaLensError::NotADeltaTable(_))));
     }
 
@@ -177,7 +186,7 @@ mod tests {
         make_commit(&log_dir, 1, action);
         make_commit(&log_dir, 2, action);
 
-        let reader = DeltaLogReader::new(tmp.path()).unwrap();
+        let reader = create_reader(&tmp);
         let entries = reader.read_all().unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].version, 0);
@@ -195,7 +204,7 @@ mod tests {
             make_commit(&log_dir, v, action);
         }
 
-        let reader = DeltaLogReader::new(tmp.path()).unwrap();
+        let reader = create_reader(&tmp);
         let entries = reader.read_range(Some(3), Some(6)).unwrap();
         assert_eq!(entries.len(), 4);
         assert_eq!(entries[0].version, 3);
@@ -213,7 +222,7 @@ mod tests {
             make_commit(&log_dir, v, action);
         }
 
-        let reader = DeltaLogReader::new(tmp.path()).unwrap();
+        let reader = create_reader(&tmp);
         let entries = reader.read_last(3).unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].version, 7);

@@ -1,19 +1,20 @@
 use crate::core::analyzer::schema::SchemaTracker;
 use crate::core::reader::DeltaLogReader;
+use crate::core::storage::storage_for;
 use crate::error::DeltaLensError;
 use crate::render::json::render_json;
 use crate::render::table::TableRenderer;
-use std::path::Path;
 
 pub fn execute(
-    path: &Path,
+    path_str: &str,
     history: bool,
     at: Option<u64>,
     json: bool,
     plain: bool,
     _no_header: bool,
 ) -> Result<(), DeltaLensError> {
-    let reader = DeltaLogReader::new(path)?;
+    let (storage, root) = storage_for(path_str)?;
+    let reader = DeltaLogReader::new(storage, &root)?;
     let max_v = reader.current_version()?;
 
     if let Some(version) = at {
@@ -29,7 +30,7 @@ pub fn execute(
             render_json(&snapshot);
         } else {
             let renderer = TableRenderer::new(plain);
-            renderer.render_schema_snapshot(path, &snapshot);
+            renderer.render_schema_snapshot(path_str, &snapshot);
         }
     } else if history {
         let entries = reader.read_all()?;
@@ -39,7 +40,7 @@ pub fn execute(
             render_json(&evolution);
         } else {
             let renderer = TableRenderer::new(plain);
-            renderer.render_schema_history(path, &evolution);
+            renderer.render_schema_history(path_str, &evolution);
         }
     } else {
         let entries = reader.read_all()?;
@@ -51,7 +52,7 @@ pub fn execute(
             render_json(&snapshot);
         } else {
             let renderer = TableRenderer::new(plain);
-            renderer.render_schema_snapshot(path, &snapshot);
+            renderer.render_schema_snapshot(path_str, &snapshot);
         }
     }
 

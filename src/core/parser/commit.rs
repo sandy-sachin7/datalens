@@ -15,6 +15,18 @@ impl CommitParser {
     pub fn parse_file(path: &Path) -> Result<Vec<Action>, DeltaLensError> {
         let file = File::open(path).map_err(DeltaLensError::Io)?;
         let reader = BufReader::new(file);
+        let path_str = path.to_string_lossy();
+        Self::parse_reader(reader, &path_str)
+    }
+
+    /// Parse all actions from raw bytes (e.g., from a storage backend).
+    pub fn parse_bytes(data: &[u8], path_str: &str) -> Result<Vec<Action>, DeltaLensError> {
+        let reader = BufReader::new(data);
+        Self::parse_reader(reader, path_str)
+    }
+
+    /// Internal: parse actions from any BufRead source.
+    fn parse_reader<R: BufRead>(reader: R, path_str: &str) -> Result<Vec<Action>, DeltaLensError> {
         let mut actions = Vec::new();
 
         for (line_num, line) in reader.lines().enumerate() {
@@ -37,9 +49,7 @@ impl CommitParser {
                     }
                     eprintln!(
                         "Warning: Skipping malformed/unparseable action at {} (line {}): {}",
-                        path.display(),
-                        line_num,
-                        e
+                        path_str, line_num, e
                     );
                 }
             }
@@ -86,7 +96,7 @@ mod tests {
     #[test]
     fn test_skips_empty_lines() {
         let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, "").unwrap();
+        writeln!(f).unwrap();
         writeln!(
             f,
             r#"{{"add":{{"path":"p.parquet","size":100,"modificationTime":0,"dataChange":true,"partitionValues":{{}}}}}}"#

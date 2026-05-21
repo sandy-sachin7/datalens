@@ -1,5 +1,4 @@
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "deltalens")]
@@ -30,8 +29,8 @@ pub struct Cli {
 pub enum Commands {
     /// Table health report
     Inspect {
-        /// Path to the Delta table
-        path: PathBuf,
+        /// Path to the Delta table (local path or s3:// URI)
+        path: String,
 
         /// Inspect at specific version (default: latest)
         #[arg(long)]
@@ -39,8 +38,8 @@ pub enum Commands {
     },
     /// Version diff
     Diff {
-        /// Path to the Delta table
-        path: PathBuf,
+        /// Path to the Delta table (local path or s3:// URI)
+        path: String,
 
         /// Starting version
         #[arg(long, required = true)]
@@ -61,8 +60,8 @@ pub enum Commands {
 
     /// Operation lineage
     Lineage {
-        /// Path to the Delta table
-        path: PathBuf,
+        /// Path to the Delta table (local path or s3:// URI)
+        path: String,
 
         /// Show last N commits (default: 20)
         #[arg(long)]
@@ -83,8 +82,8 @@ pub enum Commands {
 
     /// Filtered audit trail
     Audit {
-        /// Path to the Delta table
-        path: PathBuf,
+        /// Path to the Delta table (local path or s3:// URI)
+        path: String,
 
         /// Start date filter (YYYY-MM-DD)
         #[arg(long)]
@@ -105,8 +104,8 @@ pub enum Commands {
 
     /// Schema evolution history
     Schema {
-        /// Path to the Delta table
-        path: PathBuf,
+        /// Path to the Delta table (local path or s3:// URI)
+        path: String,
 
         /// Show full evolution history (default: current only)
         #[arg(long)]

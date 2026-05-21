@@ -4,13 +4,13 @@
 
 ```
 deltalens inspect ./transactions              # table health report
-deltalens diff ./transactions --v1 10 --v2 20 # what changed between versions
+deltalens diff s3://my-bucket/transactions --v1 10 --v2 20  # diff on S3
 deltalens lineage ./transactions --last 10    # who wrote what and when
 deltalens audit ./transactions --since 2026-04-01 --op DELETE,MERGE
-deltalens schema ./transactions --history     # full schema evolution
+deltalens schema s3://my-bucket/transactions --history     # schema on S3
 ```
 
-Native Rust binary, ~1.6 MB, zero runtime dependencies. Parses `_delta_log/*.json` commit files in
+Native Rust binary, ~5 MB, minimal runtime dependencies. Parses `_delta_log/*.json` commit files in
 parallel across all CPU cores using Rayon's work-stealing scheduler.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
@@ -174,6 +174,45 @@ deltalens lineage ./transactions --last 5
 deltalens diff ./transactions --v1 130 --v2 142
 ```
 
+### S3 tables
+
+```bash
+# Inspect a table stored in S3
+deltalens inspect s3://my-bucket/transactions
+
+# Diff two versions on S3
+deltalens diff s3://my-bucket/transactions --v1 100 --v2 150
+
+# Lineage for an S3 table
+deltalens lineage s3://my-bucket/transactions --last 10
+
+# Audit on S3
+deltalens audit s3://my-bucket/transactions --since 2026-04-01
+
+# Schema evolution on S3
+deltalens schema s3://my-bucket/transactions --history
+```
+
+### S3 authentication
+
+DeltaLens uses the standard AWS credential chain — no special flags needed:
+
+| Mechanism | How to use |
+|---|---|
+| **Access keys** | Set `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ `AWS_SESSION_TOKEN` for temp creds) |
+| **Named profile** | Set `AWS_PROFILE=<name>` (defaults to `default` in `~/.aws/credentials`) |
+| **IAM role** | Works automatically on EC2, ECS, EKS, Lambda |
+| **WebIdentity/SSO** | `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`, or `aws sso login` |
+
+| Setting | Env var | Example |
+|---|---|---|
+| Region | `AWS_REGION` or `AWS_DEFAULT_REGION` | `us-east-1` |
+| Custom endpoint | `AWS_ENDPOINT` | `https://s3.us-west-2.amazonaws.com` |
+| Allow HTTP (MinIO) | `AWS_S3_ALLOW_HTTP` | `true` |
+
+If credentials are missing, DeltaLens prints a detailed error showing exactly which env vars
+or mechanisms to configure.
+
 ### Databricks notebook cell
 
 ```python
@@ -276,11 +315,18 @@ path, and no synchronization between parse tasks (merge is a final sequential re
 See [CONTRIBUTING.md](CONTRIBUTING.md). All contributors must follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 Good first contributions: additional health metrics in `inspect`, new output fields in `lineage`,
-or a cloud storage backend (S3, ADLS, GCS) via the `object_store` crate.
+or Azure Blob / GCS storage backends via the `object_store` crate (S3 is already implemented).
 
 ---
 
 ## Changelog
+
+### v1.1.0 — 2026-05-22
+
+- **S3 object storage support**: `s3://bucket/prefix` paths work for `inspect`, `diff`, `lineage`,
+  `audit`, and `schema`. `file:///abs/path` URIs also supported. Uses the standard AWS credential
+  chain (env vars, `~/.aws/credentials`, IAM roles). Binary size increased to ~5 MB for S3 support
+  (tokio, reqwest, rustls).
 
 ### v1.0.0 — 2026-05-22
 
