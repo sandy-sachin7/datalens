@@ -8,6 +8,8 @@
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![Rayon](https://img.shields.io/badge/parallelism-rayon-red.svg?style=flat-square)](https://github.com/rayon-rs/rayon)
 [![Delta Lake](https://img.shields.io/badge/Delta_Lake-observability-blueviolet?style=flat-square)](https://delta.io)
+[![CI](https://img.shields.io/github/actions/workflow/status/sandy-sachin7/datalens/ci.yml?branch=main&label=CI&style=flat-square)](https://github.com/sandy-sachin7/datalens/actions)
+[![Latest Release](https://img.shields.io/github/v/release/sandy-sachin7/datalens?style=flat-square&color=success)](https://github.com/sandy-sachin7/datalens/releases/latest)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](http://makeapullrequest.com)
 
 </div>
@@ -103,31 +105,62 @@ DeltaLens includes a comprehensive suite of observability subcommands:
 
 ---
 
-## 📦 Getting Started
+## 📦 Installation
 
-### Prerequisites
-
-To compile DeltaLens from source, you only need the Rust toolchain:
+### ⚡ One-liner (Linux & macOS)
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+curl -fsSL https://raw.githubusercontent.com/sandy-sachin7/datalens/main/scripts/install.sh | bash
 ```
 
-### Installation
+The script auto-detects your OS and architecture (`x86_64` / `arm64`), downloads the
+pre-built binary from GitHub Releases, verifies the SHA256 checksum, and installs to
+`/usr/local/bin` (with sudo) or `~/.local/bin` (no sudo needed).
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/open-deltalens/deltalens.git
-   cd deltalens
-   ```
-2. Build the optimized release binary:
-   ```bash
-   cargo build --release
-   ```
-3. Run the CLI tool:
-   ```bash
-   ./target/release/deltalens --help
-   ```
+**Override options:**
+```bash
+# Install a specific version
+DELTALENS_VERSION=v0.2.0 curl -fsSL https://raw.githubusercontent.com/sandy-sachin7/datalens/main/scripts/install.sh | bash
+
+# Install to a custom directory
+DELTALENS_INSTALL_DIR=$HOME/bin curl -fsSL https://raw.githubusercontent.com/sandy-sachin7/datalens/main/scripts/install.sh | bash
+```
+
+---
+
+### ⚡ One-liner (Windows — PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/sandy-sachin7/datalens/main/scripts/install.ps1 | iex
+```
+
+Installs to `%USERPROFILE%\.deltalens\bin` and permanently adds it to your user `PATH`.
+
+```powershell
+# Install a specific version
+$env:DELTALENS_VERSION="v0.2.0"; irm https://raw.githubusercontent.com/sandy-sachin7/datalens/main/scripts/install.ps1 | iex
+```
+
+---
+
+### 📦 Via cargo
+
+If you already have the Rust toolchain:
+
+```bash
+cargo install deltalens
+```
+
+---
+
+### 🔨 Build from source
+
+```bash
+git clone https://github.com/sandy-sachin7/datalens.git
+cd datalens
+cargo build --release
+./target/release/deltalens --help
+```
 
 ---
 
