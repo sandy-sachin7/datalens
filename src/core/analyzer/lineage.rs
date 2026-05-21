@@ -46,7 +46,11 @@ impl LineageTracer {
             .operation_metrics
             .as_ref()
             .and_then(|m| m.get("numOutputRows"))
-            .and_then(|v| v.parse::<i64>().ok());
+            .and_then(|v| {
+                v.as_str()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .or_else(|| v.as_i64())
+            });
 
         // Build writer attribution string: prefer engineInfo, fallback to userInfo
         let writer = Self::build_writer_string(ci);

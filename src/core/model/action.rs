@@ -75,7 +75,7 @@ pub struct CommitInfoAction {
     pub cluster_id: Option<String>,
     pub user_id: Option<String>,
     pub user_name: Option<String>,
-    pub operation_metrics: Option<HashMap<String, String>>,
+    pub operation_metrics: Option<HashMap<String, serde_json::Value>>,
     pub engine_info: Option<String>,
     pub is_blind_append: Option<bool>,
     pub txn_id: Option<String>,

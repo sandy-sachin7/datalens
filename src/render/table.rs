@@ -198,7 +198,7 @@ impl TableRenderer {
 
         if issues > 0 {
             let mut msg = format!(
-                "{} {} detected. Run `deltalens suggest <path>` for recommendations.",
+                "{} {} detected. Use `inspect` output above to identify concerns.",
                 if !self.plain { "⚠ " } else { "" },
                 if issues == 1 { "issue" } else { "issues" }
             );

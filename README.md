@@ -280,6 +280,19 @@ or a cloud storage backend (S3, ADLS, GCS) via the `object_store` crate.
 
 ---
 
+## Changelog
+
+### v1.0.0 — 2026-05-22
+
+- **delta-rs compatibility fix**: `operationMetrics` values emitted as integers by delta-rs
+  (e.g. `"num_added_files": 1`) are now accepted alongside the Delta protocol standard string
+  format (`"num_added_files": "1"`). Both `inspect` and `lineage` handle the mixed types
+  transparently.
+- **Removed stale hint**: The `inspect` output no longer suggests the non-existent `suggest`
+  subcommand.
+- **Exhaustive test suite**: 80 edge-case tests covering corrupted logs, partitioned tables,
+  500+ version stress tables, all Delta data types, schema evolution, and more.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
