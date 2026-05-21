@@ -17,9 +17,11 @@ pub enum OperationType {
     Other(String),
 }
 
-impl OperationType {
-    pub fn from_str(s: &str) -> Self {
-        match s.to_uppercase().as_str() {
+impl std::str::FromStr for OperationType {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.to_uppercase().as_str() {
             "WRITE" => OperationType::Write,
             "MERGE" => OperationType::Merge,
             "DELETE" => OperationType::Delete,
@@ -31,9 +33,11 @@ impl OperationType {
             "REPLACE TABLE" => OperationType::ReplaceTable,
             "RESTORE" => OperationType::Restore,
             other => OperationType::Other(other.to_string()),
-        }
+        })
     }
+}
 
+impl OperationType {
     #[allow(dead_code)]
     pub fn as_str(&self) -> &str {
         match self {

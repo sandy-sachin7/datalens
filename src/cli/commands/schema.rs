@@ -21,8 +21,9 @@ pub fn execute(
             return Err(DeltaLensError::VersionNotFound(version));
         }
         let entries = reader.read_range(None, Some(version))?;
-        let snapshot = SchemaTracker::at_version(&entries, version)
-            .ok_or_else(|| DeltaLensError::Storage(format!("No schema found at version {}", version)))?;
+        let snapshot = SchemaTracker::at_version(&entries, version).ok_or_else(|| {
+            DeltaLensError::Storage(format!("No schema found at version {}", version))
+        })?;
 
         if json {
             render_json(&snapshot);
@@ -42,8 +43,9 @@ pub fn execute(
         }
     } else {
         let entries = reader.read_all()?;
-        let snapshot = SchemaTracker::current_schema(&entries)
-            .ok_or_else(|| DeltaLensError::Storage("No schema found in table metadata".to_string()))?;
+        let snapshot = SchemaTracker::current_schema(&entries).ok_or_else(|| {
+            DeltaLensError::Storage("No schema found in table metadata".to_string())
+        })?;
 
         if json {
             render_json(&snapshot);

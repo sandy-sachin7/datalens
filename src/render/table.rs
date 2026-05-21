@@ -4,6 +4,7 @@ use chrono::{TimeZone, Utc};
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Cell, Color, Table};
+use std::cmp::Ordering;
 use std::path::Path;
 
 pub struct TableRenderer {
@@ -224,7 +225,11 @@ impl TableRenderer {
         }
 
         table.set_header(vec![
-            Cell::new(&format!("deltalens · Version Diff  v{} → v{}", diff.v1, diff.v2)).fg(if self.plain {
+            Cell::new(format!(
+                "deltalens · Version Diff  v{} → v{}",
+                diff.v1, diff.v2
+            ))
+            .fg(if self.plain {
                 Color::Reset
             } else {
                 Color::Cyan
@@ -251,24 +256,21 @@ impl TableRenderer {
             } else {
                 for change in &diff.schema_changes {
                     for col in &change.added_columns {
-                        let cell_label = if self.plain { "+ added" } else { "+ added" };
-                        let mut action_cell = Cell::new(cell_label);
+                        let mut action_cell = Cell::new("+ added");
                         if !self.plain {
                             action_cell = action_cell.fg(Color::Green);
                         }
                         table.add_row(vec![action_cell, Cell::new(col)]);
                     }
                     for col in &change.removed_columns {
-                        let cell_label = if self.plain { "- removed" } else { "- removed" };
-                        let mut action_cell = Cell::new(cell_label);
+                        let mut action_cell = Cell::new("- removed");
                         if !self.plain {
                             action_cell = action_cell.fg(Color::Red);
                         }
                         table.add_row(vec![action_cell, Cell::new(col)]);
                     }
                     for (name, old_t, new_t) in &change.modified_columns {
-                        let cell_label = if self.plain { "~ modified" } else { "~ modified" };
-                        let mut action_cell = Cell::new(cell_label);
+                        let mut action_cell = Cell::new("~ modified");
                         if !self.plain {
                             action_cell = action_cell.fg(Color::Yellow);
                         }
@@ -315,11 +317,13 @@ impl TableRenderer {
             table.add_row(vec!["Net Size Delta", &net_size_str]);
 
             table.add_row(vec![
-                Cell::new(format!("OPERATIONS ({} commits)", diff.total_commits)).fg(if self.plain {
-                    Color::Reset
-                } else {
-                    Color::Yellow
-                }),
+                Cell::new(format!("OPERATIONS ({} commits)", diff.total_commits)).fg(
+                    if self.plain {
+                        Color::Reset
+                    } else {
+                        Color::Yellow
+                    },
+                ),
                 Cell::new(""),
             ]);
 
@@ -367,7 +371,11 @@ impl TableRenderer {
         println!("{table}");
     }
 
-    pub fn render_lineage(&self, _path: &Path, entries: &[crate::core::model::lineage::LineageEntry]) {
+    pub fn render_lineage(
+        &self,
+        _path: &Path,
+        entries: &[crate::core::model::lineage::LineageEntry],
+    ) {
         if entries.is_empty() {
             println!("No lineage entries found.");
             return;
@@ -394,12 +402,10 @@ impl TableRenderer {
                     } else {
                         r.to_string()
                     };
-                    if r > 0 {
-                        format!("+{} rows", formatted_r)
-                    } else if r < 0 {
-                        format!("{} rows", formatted_r)
-                    } else {
-                        "±0 rows".to_string()
+                    match r.cmp(&0) {
+                        Ordering::Greater => format!("+{} rows", formatted_r),
+                        Ordering::Less => format!("{} rows", formatted_r),
+                        Ordering::Equal => "±0 rows".to_string(),
                     }
                 }
                 None => "".to_string(),
@@ -416,10 +422,14 @@ impl TableRenderer {
                 let dt_styled = dt_str.truecolor(128, 128, 128); // gray
 
                 let op_styled = match entry.operation {
-                    crate::core::model::lineage::OperationType::Write => entry.operation_raw.green(),
+                    crate::core::model::lineage::OperationType::Write => {
+                        entry.operation_raw.green()
+                    }
                     crate::core::model::lineage::OperationType::Merge => entry.operation_raw.blue(),
                     crate::core::model::lineage::OperationType::Delete => entry.operation_raw.red(),
-                    crate::core::model::lineage::OperationType::Update => entry.operation_raw.yellow(),
+                    crate::core::model::lineage::OperationType::Update => {
+                        entry.operation_raw.yellow()
+                    }
                     crate::core::model::lineage::OperationType::Optimize => {
                         entry.operation_raw.magenta()
                     }
@@ -440,18 +450,17 @@ impl TableRenderer {
 
                 println!(
                     "{:<14}  {:<25}  {:<22}  {:<32}  {:<18}  {}",
-                    version_styled,
-                    dt_styled,
-                    op_styled,
-                    writer_styled,
-                    size_styled,
-                    rows_styled
+                    version_styled, dt_styled, op_styled, writer_styled, size_styled, rows_styled
                 );
             }
         }
     }
 
-    pub fn render_audit(&self, _path: &Path, entries: &[crate::core::model::lineage::LineageEntry]) {
+    pub fn render_audit(
+        &self,
+        _path: &Path,
+        entries: &[crate::core::model::lineage::LineageEntry],
+    ) {
         if entries.is_empty() {
             println!("No audit operations found matching the criteria.");
             return;
@@ -490,12 +499,10 @@ impl TableRenderer {
                     } else {
                         r.to_string()
                     };
-                    if r > 0 {
-                        format!("+{} rows", formatted_r)
-                    } else if r < 0 {
-                        format!("{} rows", formatted_r)
-                    } else {
-                        "±0 rows".to_string()
+                    match r.cmp(&0) {
+                        Ordering::Greater => format!("+{} rows", formatted_r),
+                        Ordering::Less => format!("{} rows", formatted_r),
+                        Ordering::Equal => "±0 rows".to_string(),
                     }
                 }
                 None => size_str,
@@ -513,7 +520,9 @@ impl TableRenderer {
                 let op_styled = match entry.operation {
                     crate::core::model::lineage::OperationType::Merge => entry.operation_raw.blue(),
                     crate::core::model::lineage::OperationType::Delete => entry.operation_raw.red(),
-                    crate::core::model::lineage::OperationType::Update => entry.operation_raw.yellow(),
+                    crate::core::model::lineage::OperationType::Update => {
+                        entry.operation_raw.yellow()
+                    }
                     _ => entry.operation_raw.normal(),
                 };
 
@@ -547,7 +556,7 @@ impl TableRenderer {
         }
 
         table.set_header(vec![
-            Cell::new(&format!("Schema at Version {}", snapshot.version)).fg(if self.plain {
+            Cell::new(format!("Schema at Version {}", snapshot.version)).fg(if self.plain {
                 Color::Reset
             } else {
                 Color::Cyan
@@ -560,10 +569,26 @@ impl TableRenderer {
         ]);
 
         table.add_row(vec![
-            Cell::new("Field Name").fg(if self.plain { Color::Reset } else { Color::Yellow }),
-            Cell::new("Type").fg(if self.plain { Color::Reset } else { Color::Yellow }),
-            Cell::new("Nullable").fg(if self.plain { Color::Reset } else { Color::Yellow }),
-            Cell::new("Metadata").fg(if self.plain { Color::Reset } else { Color::Yellow }),
+            Cell::new("Field Name").fg(if self.plain {
+                Color::Reset
+            } else {
+                Color::Yellow
+            }),
+            Cell::new("Type").fg(if self.plain {
+                Color::Reset
+            } else {
+                Color::Yellow
+            }),
+            Cell::new("Nullable").fg(if self.plain {
+                Color::Reset
+            } else {
+                Color::Yellow
+            }),
+            Cell::new("Metadata").fg(if self.plain {
+                Color::Reset
+            } else {
+                Color::Yellow
+            }),
         ]);
 
         for field in &snapshot.schema.fields {

@@ -1,3 +1,4 @@
+use crate::cli::output_opts::OutputOpts;
 use crate::core::analyzer::diff::DiffAnalyzer;
 use crate::core::reader::DeltaLogReader;
 use crate::error::DeltaLensError;
@@ -11,9 +12,7 @@ pub fn execute(
     v2: u64,
     schema_only: bool,
     files_only: bool,
-    json: bool,
-    plain: bool,
-    _no_header: bool,
+    opts: OutputOpts,
 ) -> Result<(), DeltaLensError> {
     let reader = DeltaLogReader::new(path)?;
     let max_v = reader.current_version()?;
@@ -32,10 +31,10 @@ pub fn execute(
 
     let diff = DiffAnalyzer::diff(v1, &entries_before, &entries_after);
 
-    if json {
+    if opts.json {
         render_json(&diff);
     } else {
-        let renderer = TableRenderer::new(plain);
+        let renderer = TableRenderer::new(opts.plain);
         renderer.render_diff(path, &diff, schema_only, files_only);
     }
 

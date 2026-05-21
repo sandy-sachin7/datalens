@@ -4,14 +4,14 @@ use std::path::Path;
 
 fn bench_log_parsing(c: &mut Criterion) {
     let mut group = c.benchmark_group("log_parsing");
-    
+
     for fixture in &["small", "medium", "large"] {
         let path = format!("benches/fixtures/{}", fixture);
-        
+
         if !Path::new(&path).exists() {
             continue;
         }
-        
+
         group.bench_with_input(
             BenchmarkId::new("read_all_commits", fixture),
             fixture,
@@ -23,7 +23,7 @@ fn bench_log_parsing(c: &mut Criterion) {
             },
         );
     }
-    
+
     group.finish();
 }
 

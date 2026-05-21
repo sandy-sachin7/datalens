@@ -8,10 +8,7 @@ impl LineageTracer {
     /// Reconstruct lineage from a slice of commit entries.
     /// Returns entries in ascending version order.
     pub fn trace(entries: &[CommitEntry]) -> Vec<LineageEntry> {
-        entries
-            .iter()
-            .filter_map(|e| Self::entry_lineage(e))
-            .collect()
+        entries.iter().filter_map(Self::entry_lineage).collect()
     }
 
     fn entry_lineage(entry: &CommitEntry) -> Option<LineageEntry> {
@@ -61,7 +58,10 @@ impl LineageTracer {
             .or_else(|| ci.operation_parameters.get("condition"))
             .and_then(|v| v.as_str().map(String::from));
 
-        let operation = OperationType::from_str(&ci.operation);
+        let operation = ci
+            .operation
+            .parse::<OperationType>()
+            .unwrap_or(OperationType::Other(ci.operation.clone()));
 
         Some(LineageEntry {
             version: entry.version,
