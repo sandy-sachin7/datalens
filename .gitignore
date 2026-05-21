@@ -1,0 +1,47 @@
+# Rust build artifacts
+/target
+
+# Internal AI agent context (not for public repos)
+ANTIGRAVITY.md
+
+# Generated benchmark fixtures (large, auto-generated — use scripts/gen_fixture.py to regenerate)
+# small fixture is committed as a quick smoke-test sample
+# medium (12 MB) and large (98 MB) are excluded — run scripts/gen_fixture.py to regenerate
+benches/fixtures/medium/
+benches/fixtures/large/
+
+# Criterion benchmark results (HTML reports, raw data)
+criterion/
+
+# Editor and IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows metadata
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+*.crt
+secrets/
+
+# Python cache (fixture generator)
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Logs
+*.log
