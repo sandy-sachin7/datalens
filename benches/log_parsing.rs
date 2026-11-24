@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use deltalens::core::reader::DeltaLogReader;
 use deltalens::core::storage::LocalStorage;
+use deltalens::{DeltaLogReader, HealthAnalyzer};
 
 fn bench_log_parsing(c: &mut Criterion) {
     let mut group = c.benchmark_group("log_parsing");
@@ -20,6 +20,17 @@ fn bench_log_parsing(c: &mut Criterion) {
             fixture,
             |b, _| {
                 b.iter(|| reader.read_range(None, None).unwrap());
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("snapshot_and_health", fixture),
+            fixture,
+            |b, _| {
+                b.iter(|| {
+                    let snapshot = reader.read_snapshot_log(None).unwrap();
+                    HealthAnalyzer::analyze_snapshot(&snapshot)
+                });
             },
         );
     }

@@ -22,28 +22,11 @@ pub fn execute(
 
     let (storage, root) = storage_for(path_str)?;
     let reader = DeltaLogReader::new(storage, &root)?;
-    let max_v = reader.current_version()?;
 
-    if v1 > max_v {
-        return Err(DeltaLensError::VersionNotFound(v1));
-    }
-    if v2 > max_v {
-        return Err(DeltaLensError::VersionNotFound(v2));
-    }
-
-    // Reconstruct state at v1 (checkpoint-accelerated!).
-    let snap_v1 = reader.read_snapshot_log(Some(v1))?;
+    // Reconstruct state at v1 and read v1+1..=v2 in a single discovery pass,
+    // preserving `_last_checkpoint` offset listing on large cloud tables.
+    let (snap_v1, entries_after, after_warnings) = reader.read_diff_logs(v1, v2)?;
     let state_v1 = TableState::from_snapshot(&snap_v1);
-
-    // Read only v1+1..=v2 (checked_add prevents overflow when v1 == u64::MAX).
-    let (entries_after, after_warnings) = if v1 == v2 {
-        (Vec::new(), Vec::new())
-    } else {
-        let start = v1
-            .checked_add(1)
-            .ok_or(DeltaLensError::InvalidVersionRange(v1, v2))?;
-        reader.read_range_with_warnings(Some(start), Some(v2))?
-    };
 
     if opts.verbose {
         eprintln!(

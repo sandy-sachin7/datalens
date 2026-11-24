@@ -220,6 +220,54 @@ impl DeltaLogReader {
         self.read_snapshot_log_from_inventory(inv, target_version)
     }
 
+    /// Read a checkpoint-accelerated snapshot at `v1` together with incremental commits
+    /// in `(v1 + 1)..=v2` using a single inventory discovery. On cloud object stores,
+    /// preserves `_last_checkpoint` + `list_with_offset` whenever `v1 >= _last_checkpoint`.
+    pub fn read_diff_logs(
+        &self,
+        v1: u64,
+        v2: u64,
+    ) -> Result<(SnapshotLog, Vec<CommitEntry>, Vec<ParseWarning>), DeltaLensError> {
+        if v1 > v2 {
+            return Err(DeltaLensError::InvalidVersionRange(v1, v2));
+        }
+
+        if let Some(partial_inv) = self.try_snapshot_inventory(Some(v1))? {
+            return self.read_diff_logs_from_inventory(&partial_inv, v1, v2);
+        }
+
+        let inv = self.inventory()?;
+        self.read_diff_logs_from_inventory(inv, v1, v2)
+    }
+
+    fn read_diff_logs_from_inventory(
+        &self,
+        inv: &LogInventory,
+        v1: u64,
+        v2: u64,
+    ) -> Result<(SnapshotLog, Vec<CommitEntry>, Vec<ParseWarning>), DeltaLensError> {
+        let max_v = inv.max_version().ok_or(DeltaLensError::EmptyTable)?;
+        if v1 > max_v {
+            return Err(DeltaLensError::VersionNotFound(v1));
+        }
+        if v2 > max_v {
+            return Err(DeltaLensError::VersionNotFound(v2));
+        }
+
+        let snap_v1 = self.read_snapshot_log_from_inventory(inv, Some(v1))?;
+        let (entries_after, after_warnings) = if v1 == v2 {
+            (Vec::new(), Vec::new())
+        } else {
+            let start = v1
+                .checked_add(1)
+                .ok_or(DeltaLensError::InvalidVersionRange(v1, v2))?;
+            let (entries, warnings, _) = self.read_contiguous_range(inv, start, v2, true)?;
+            (entries, warnings)
+        };
+
+        Ok((snap_v1, entries_after, after_warnings))
+    }
+
     fn read_snapshot_log_from_inventory(
         &self,
         inv: &LogInventory,
@@ -1568,7 +1616,36 @@ mod tests {
         assert_eq!(offset_calls_hist.load(Ordering::SeqCst), 0);
         assert_eq!(full_calls_hist.load(Ordering::SeqCst), 1);
 
-        // 3. Stale _last_checkpoint (points to non-existent v99) falls back to full list()!
+        // 3. Diff between versions >= _last_checkpoint uses list_from_offset and NEVER calls full list()!
+        let (reader_diff, full_calls_diff, offset_calls_diff) = make_reader(Arc::clone(&mem));
+        let (diff_snap_v1, diff_after, _diff_warnings) =
+            reader_diff.read_diff_logs(16, 19).unwrap();
+        assert_eq!(diff_snap_v1.target_version, 16);
+        assert_eq!(diff_snap_v1.checkpoint_version, Some(15));
+        assert_eq!(diff_snap_v1.commits.len(), 1); // 16
+        assert_eq!(diff_after.len(), 3); // 17, 18, 19
+        assert_eq!(offset_calls_diff.load(Ordering::SeqCst), 1);
+        assert_eq!(full_calls_diff.load(Ordering::SeqCst), 0);
+
+        // 3b. Diff with v2 > max_v returns VersionNotFound without triggering full list().
+        let (reader_diff_oob, full_calls_oob, offset_calls_oob) = make_reader(Arc::clone(&mem));
+        assert!(matches!(
+            reader_diff_oob.read_diff_logs(16, 25),
+            Err(DeltaLensError::VersionNotFound(25))
+        ));
+        assert_eq!(offset_calls_oob.load(Ordering::SeqCst), 1);
+        assert_eq!(full_calls_oob.load(Ordering::SeqCst), 0);
+
+        // 3c. Diff with v1 < _last_checkpoint falls back to full list().
+        let (reader_diff_hist, full_calls_dhist, offset_calls_dhist) =
+            make_reader(Arc::clone(&mem));
+        let (dhist_snap_v1, dhist_after, _) = reader_diff_hist.read_diff_logs(10, 19).unwrap();
+        assert_eq!(dhist_snap_v1.target_version, 10);
+        assert_eq!(dhist_after.len(), 9); // 11..=19
+        assert_eq!(offset_calls_dhist.load(Ordering::SeqCst), 0);
+        assert_eq!(full_calls_dhist.load(Ordering::SeqCst), 1);
+
+        // 4. Stale _last_checkpoint (points to non-existent v99) falls back to full list()!
         rt.block_on(async {
             mem.put(
                 &ObjectStorePath::from("warehouse/t/_delta_log/_last_checkpoint"),

@@ -8,7 +8,7 @@
     Releases, verifies its SHA-256 checksum, and installs it to a directory on your PATH.
 
 .PARAMETER Version
-    Specific version to install (e.g. "v1.1.0"). Defaults to latest.
+    Specific version to install (e.g. "v2.0.0"). Defaults to latest.
 
 .PARAMETER InstallDir
     Directory to install the binary. Defaults to $env:USERPROFILE\.deltalens\bin

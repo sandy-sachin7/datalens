@@ -1,32 +1,88 @@
 # DeltaLens
 
-**Standalone CLI to inspect, diff, trace, and audit Delta Lake tables from your terminal — no Spark, no JVM, no Python.**
+**Standalone CLI & Rust library to inspect, diff, trace, and audit Delta Lake tables from your terminal — no Spark, no JVM, no Python.**
 
-```bash
-deltalens inspect ./transactions                           # table health, checkpoints, tombstones & skew
-deltalens diff s3://my-bucket/transactions --v1 10 --v2 20 # schema & file diff on S3
-deltalens lineage ./transactions --last 10 --op WRITE      # who wrote what and when
-deltalens audit ./transactions --since 2026-04-01 --op DELETE,MERGE
-deltalens schema gs://my-bucket/transactions --history     # recursive schema evolution on GCS
-```
-
-Native Rust binary that reads Delta Lake transaction logs directly — including JSON commits, classic and multi-part Parquet checkpoints, V2 checkpoints with `_sidecars/`, log compaction files (`.compacted.json`), Deletion Vectors, Column Mapping, and Liquid Clustering.
-
+[![Crates.io](https://img.shields.io/crates/v/deltalens.svg?style=flat-square)](https://crates.io/crates/deltalens)
+[![docs.rs](https://img.shields.io/docsrs/deltalens?style=flat-square)](https://docs.rs/deltalens)
+[![GitHub Release](https://img.shields.io/github/v/release/sandy-sachin7/datalens?style=flat-square)](https://github.com/sandy-sachin7/datalens/releases)
+[![CI](https://github.com/sandy-sachin7/datalens/actions/workflows/ci.yml/badge.svg)](https://github.com/sandy-sachin7/datalens/actions/workflows/ci.yml)
+[![MSRV: Rust 1.80+](https://img.shields.io/badge/MSRV-Rust%201.80%2B-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org)
-[![CI](https://github.com/sandy-sachin7/datalens/actions/workflows/ci.yml/badge.svg)](https://github.com/sandy-sachin7/datalens/actions)
+
+Native Rust binary that reads `_delta_log/` metadata directly — including NDJSON commits, classic & multi-part Parquet checkpoints, V2 checkpoints with `_sidecars/`, `.compacted.json` files, Deletion Vectors, Column Mapping renames, and Liquid Clustering — across local disks, AWS S3, Google Cloud Storage, and Azure Data Lake.
 
 ---
 
-## Install
+## See It in Action
 
-**Linux & macOS (one-liner)**
+### Table health, Deletion Vectors, tombstones, checkpoints & skew
+
+```text
+$ deltalens inspect ./transactions --plain
++---------------------------------+---------------------------------------------------------------------------------------------------------+
+| deltalens · Table Health Report | ./transactions                                                                                          |
++===========================================================================================================================================+
+| Current Version                 | v012                                                                                                    |
+| Created                         | 2025-10-09 08:53:20 UTC                                                                                 |
+| Last Modified                   | 2025-10-20 22:40:00 UTC                                                                                 |
+| Protocol                        | reader=3, writer=7 (r:[columnMapping, deletionVectors], w:[columnMapping, deletionVectors, clustering]) |
+|---------------------------------+---------------------------------------------------------------------------------------------------------|
+| DATA FILES                      |                                                                                                         |
+| Total Files                     | 14                                                                                                      |
+| Total Size                      | 345.8 MB                                                                                                |
+| Avg / Min / Max File Size       | 24.7 MB / 524.3 KB / 134.2 MB                                                                           |
+| Small Files (<32MB)             | 10 (71.4%)                                                                                              |
+| Skew Score                      | 0.85 / 1.0                                                                                              |
+| Deletion Vectors                | 1 files (1420 deleted rows)                                                                             |
+|---------------------------------+---------------------------------------------------------------------------------------------------------|
+| PARTITIONS & MAINTENANCE        |                                                                                                         |
+| Partition Columns               | region (3 partitions, 0 empty)                                                                          |
+| Last CHECKPOINT                 | v010                                                                                                    |
+| Clustering Columns              | customer_id, txn_id                                                                                     |
+| Active Tombstones               | 3 (228.6 MB reclaimable), oldest 2025-09-16                                                             |
+| SCHEMA                          | 5 columns · 1 schema change in analyzed log                                                             |
++---------------------------------+---------------------------------------------------------------------------------------------------------+
+
+WARN: 2 issues detected:
+  - High file size skew (0.85 / 1.0)
+  - High small-file ratio: 10 of 14 files (71.4%) are < 32 MB
+```
+
+### Recursive schema diff & CI breaking-change gate (exit code `2`)
+
+```text
+$ deltalens diff ./transactions --v1 10 --v2 12 --plain --fail-on-breaking
++---------------------------------------+--------------------------------------------------------------------------------------------------------+
+| deltalens · Version Diff  v010 → v012 | ./transactions                                                                                         |
++================================================================================================================================================+
+| SCHEMA CHANGES                        |                                                                                                        |
+| + added                               | currency                                                                                               |
+| - removed [BREAKING]                  | legacy_code                                                                                            |
+| → renamed [BREAKING]                  | customer_id → account_id                                                                               |
+| ~ modified [BREAKING]                 | amount (double → integer)                                                                              |
+| ~ nullable [BREAKING]                 | amount (true → false)                                                                                  |
+|---------------------------------------+--------------------------------------------------------------------------------------------------------|
+| DATA CHANGES                          |                                                                                                        |
+| Files Added / Removed / Net           | +3 / -1 / +2                                                                                           |
+| Size Added / Removed / Net            | 243.3 MB / 134.2 MB / +109.1 MB                                                                        |
+|---------------------------------------+--------------------------------------------------------------------------------------------------------|
+| OPERATIONS (2 commits)                | MERGE (1), WRITE (1)                                                                                   |
+| PARTITION CHANGES                     | New: 1 (region=ap-south) · Removed: 0                                                                  |
++---------------------------------------+--------------------------------------------------------------------------------------------------------+
+# exits with code 2 because breaking schema changes were detected
+```
+
+---
+
+## 30-Second Quickstart
+
+### 1. Install
+
+**Linux & macOS (one-liner with strict SHA-256 verification)**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sandy-sachin7/datalens/main/scripts/install.sh | bash
 ```
-
-Auto-detects OS and architecture, downloads from GitHub Releases, and strictly verifies SHA-256 checksums before installing.
 
 **Windows (PowerShell)**
 
@@ -34,137 +90,221 @@ Auto-detects OS and architecture, downloads from GitHub Releases, and strictly v
 irm https://raw.githubusercontent.com/sandy-sachin7/datalens/main/scripts/install.ps1 | iex
 ```
 
-**Cargo**
+**Cargo (crates.io)**
 
 ```bash
-# Full build with S3, GCS, and Azure object storage backends (default)
+# Full build with AWS S3, GCS, and Azure backends (default)
 cargo install deltalens
 
-# Local-only minimal build (no cloud SDKs)
+# Air-gapped / pure-local binary (zero cloud or HTTP dependencies)
 cargo install deltalens --no-default-features
 ```
 
-**Build from source**
+### 2. Inspect, diff, trace, and automate with `jq`
 
 ```bash
-git clone https://github.com/sandy-sachin7/datalens.git
-cd datalens
-cargo build --release
-./target/release/deltalens --help
+# Inspect table health (local or cloud URI)
+deltalens inspect ./transactions
+deltalens inspect s3://my-bucket/warehouse/transactions --fail-on-issues
+
+# Diff two versions and fail CI on breaking schema changes (exit code 2)
+deltalens diff ./transactions --v1 10 --v2 12 --fail-on-breaking
+
+# Trace recent writers and audit DELETE/MERGE compliance events
+deltalens lineage ./transactions --last 10 --op WRITE
+deltalens audit ./transactions --since 2026-04-01 --op DELETE,MERGE
+
+# View full recursive schema evolution history
+deltalens schema gs://my-bucket/transactions --history
+```
+
+**`jq` automation recipes:**
+
+```bash
+# Check small-file percentage & skew score in monitoring scripts
+deltalens inspect ./transactions --json | jq '{version: .current_version, small_pct: .health.small_file_pct, skew: .health.skew_score}'
+
+# Alert when expired tombstones exceed 1 GiB (VACUUM needed)
+deltalens inspect ./transactions --json | jq -e '.tombstones.expired_reclaimable_bytes < 1073741824'
+
+# Extract active Deletion Vector deleted rows and Liquid Clustering columns
+deltalens inspect ./transactions --json | jq '{dv_files: .health.deletion_vector_files, dv_rows: .health.deleted_rows_in_dvs, clustering: .maintenance.clustering_columns}'
+
+# List breaking schema changes between versions as JSON
+deltalens diff ./transactions --v1 10 --v2 12 --json | jq '.schema_changes[] | select(.has_breaking_changes)'
 ```
 
 ---
 
-## Why not just use Spark?
+## Why Not Just Use Spark?
 
 | Approach | Cold start | Runtime required | Command |
 | :--- | :--- | :--- | :--- |
 | Spark SQL | 10–30s | JVM + Spark cluster | `DESCRIBE HISTORY` |
 | Databricks SQL | 5–15s | Active SQL warehouse | `DESCRIBE HISTORY` |
 | delta-rs (Python) | 1–3s | Python + venv + wheels | `DeltaTable.history()` |
-| **DeltaLens** | **<10ms** | **Single binary** | `deltalens lineage` |
+| **DeltaLens** | **<10ms** | **Single binary** | `deltalens inspect` / `lineage` |
 
-DeltaLens reads only `_delta_log/` metadata (checkpoints, sidecars, compacted logs, and JSON commits) — not Parquet data files. That answers observability questions (file counts, size skew, active tombstones, Deletion Vectors, schema evolution, breaking changes, writer attribution, partition layout) in milliseconds.
-
-**Use DeltaLens when you need:**
-- CI/CD health gates (`--fail-on-issues`) and breaking-schema gates (`--fail-on-breaking`) without a Spark cluster
-- Fast local or cloud (`s3://`, `s3a://`, `gs://`, `az://`, `abfss://`) debugging from your terminal
-- Scriptable `--json` output piped into `jq` for automated monitoring
-
-**Use Spark or delta-rs when you need to read row data, join across tables, or run SQL.**
-
----
-
-## Commands
-
-| Command | What it does | Key flags |
-| :--- | :--- | :--- |
-| `inspect <path>` | Table health, file skew, tombstones, DVs, maintenance & protocol features | `--version <n>`, `--fail-on-issues` |
-| `diff <path>` | File deltas (logical & physical), partition diffs, recursive schema diffs | `--v1 <n> --v2 <n>`, `--schema-only`, `--files-only`, `--fail-on-breaking` |
-| `lineage <path>` | Writer attribution, row counts & operation timeline | `--last <n>`, `--since <YYYY-MM-DD>`, `--op <ops>`, `--user <u>` |
-| `audit <path>` | Compliance audit trail, filterable by date range, op, and user | `--since <YYYY-MM-DD>`, `--until <YYYY-MM-DD>`, `--op <ops>`, `--user <u>` |
-| `schema <path>` | Active column layout or full recursive schema evolution history | `--history`, `--at <v>` |
-| `config` | Manage settings and local telemetry | `show`, `path`, `metrics`, `set <key> <value>` |
-
-### Global flags
-
-| Flag | Effect |
-| :--- | :--- |
-| `--json` | Machine-readable JSON output (supported across all commands including `config`) |
-| `--plain` | Strictly ANSI-free plain text (also honors `NO_COLOR` and non-TTY stdout) |
-| `--no-header` | Omit table headers and title banners |
-| `-v`, `--verbose` | Print checkpoint discovery, file counts, and parse warnings to stderr |
-
-### Exit codes
-
-- `0`: Success
-- `1`: Error (invalid arguments, missing table/version, version gap, storage/auth error)
-- `2`: CI gate triggered (`inspect --fail-on-issues` found issues, or `diff --fail-on-breaking` detected breaking schema changes)
-
----
-
-## Usage examples
-
-### CI/CD quality & schema gates
-
-```yaml
-- name: Gate on table health and breaking schema changes
-  run: |
-    deltalens inspect ./delta-table --plain --fail-on-issues
-    deltalens diff ./delta-table --v1 10 --v2 20 --fail-on-breaking
-```
-
-### Cloud object storage
-
-DeltaLens supports `s3://`, `s3a://`, `s3n://`, `gs://`, `az://`, `abfs://`, `abfss://`, and `file://` URIs via `object_store` (bounded async concurrency on Tokio):
-
-```bash
-deltalens inspect s3://my-bucket/warehouse/transactions
-deltalens diff gs://my-bucket/warehouse/transactions --v1 100 --v2 150
-deltalens schema abfss://container@account.dfs.core.windows.net/transactions --history
-```
-
-#### S3 environment variables
-
-| Setting | Environment variable(s) |
-| :--- | :--- |
-| Access keys | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN` |
-| Region | `AWS_REGION` or `AWS_DEFAULT_REGION` |
-| Custom endpoint | `AWS_ENDPOINT` (MinIO, Cloudflare R2, LocalStack) |
-| Plain HTTP (local dev) | `AWS_ALLOW_HTTP=true` |
-| IAM / OIDC roles | Automatic on EC2/ECS/EKS, or `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN` |
-
-*(Note: `object_store` reads environment variables and IMDS/OIDC directly; if using a named AWS CLI profile, export credentials to the environment first.)*
-
----
-
-## Telemetry
-
-DeltaLens includes opt-in, strictly local telemetry. Nothing is collected or transmitted by default.
-
-```bash
-deltalens config set telemetry true   # opt in
-deltalens config metrics              # view P50/P95/P99 latencies and command counts
-deltalens config metrics --json       # machine-readable metrics summary
-```
-
-Metrics are written locally under `$DELTALENS_DATA_DIR`, `$XDG_DATA_HOME/deltalens`, `~/.local/share/deltalens`, or `%LOCALAPPDATA%\deltalens`. Nothing is ever sent over the network.
+DeltaLens reads only `_delta_log/` metadata (checkpoints, sidecars, compacted logs, and JSON commits) — never Parquet data files. Use **DeltaLens** for instant observability, debugging, and CI/CD quality/schema gates; use **Spark** or **delta-rs** when querying row data or running SQL joins.
 
 ---
 
 ## Architecture
 
-1. **Single-listing discovery**: Lists `_delta_log/` non-recursively once per command, cataloging strict 20-digit commits, classic/multi-part Parquet checkpoints, V2 JSON/Parquet checkpoints, `_last_checkpoint`, and `.compacted.json` files.
-2. **Checkpoint-accelerated replay**: Snapshot commands (`inspect`, `schema`, `diff`) start from the latest complete checkpoint `<= target_version`, resolve V2 `_sidecars/` Parquet files, and replay only subsequent commits.
-3. **Concurrent I/O + parallel parse**: Cloud backends batch-read with bounded Tokio `buffer_unordered` concurrency; local disk and JSON/Parquet parsing parallelize via Rayon.
-4. **Protocol-compliant state machine**: Applies same-commit `remove` before `add`, percent-decodes paths, keys active files by `(canonical_path, dv_unique_id)`, enriches missing `Remove.size` from prior state, and tracks active tombstones, live partitions, protocol features, and `delta.clustering` domain metadata.
+```mermaid
+flowchart LR
+    S["Local / S3 / GCS / Azure<br/>(Read-Only StorageBackend)"]
+    D["Discovery &<br/>_last_checkpoint Offset Seek"]
+    P["Checkpoint / Sidecar / Commit<br/>Parallel Parse (Tokio + Rayon)"]
+    T["Unified TableState<br/>(Remove-before-Add, DVs, Tombstones)"]
+    A["Health / Diff / Lineage / Schema<br/>Analyzers"]
+    O["Table / JSON /<br/>CI Exit-2 Gates"]
+
+    S --> D --> P --> T --> A --> O
+```
+
+- **Zero nested runtimes**: Cloud backends fetch objects concurrently via a shared Tokio `buffer_unordered(32)` stream; local disk I/O and CPU-bound NDJSON/Arrow-Parquet parsing parallelize via Rayon.
+- **`_last_checkpoint` offset listing**: Snapshot and diff commands on cloud stores read `_last_checkpoint` and call `list_with_offset` to skip listing thousands of pre-checkpoint commits, falling back automatically when inspecting pre-checkpoint history or stale hints.
+- See [ARCHITECTURE.md](ARCHITECTURE.md) for the complete module map, replay state machine, and security design.
 
 ---
 
-## Contributing
+## Delta Lake Protocol Compatibility Matrix
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+| Protocol Feature | Supported | Details |
+| :--- | :---: | :--- |
+| NDJSON Commits (`00000...0.json`) | ✅ | Strict 20-digit parsing, structured parse warnings (`-v`) |
+| Classic Single-File Parquet Checkpoints | ✅ | Arrow/Parquet reader (`snap`, `zstd`, `flate2`, `lz4`) |
+| Multi-Part Parquet Checkpoints (`part-00001-of-N`) | ✅ | Completeness validation + parallel part loading |
+| V2 Checkpoints (JSON & Parquet) + `_sidecars/` | ✅ | Validated `_delta_log/_sidecars/` resolution |
+| Log Compaction (`.compacted.json`) | ✅ | Contiguous range acceleration + commit precedence |
+| `_last_checkpoint` Offset Listing | ✅ | Skips historical pre-checkpoint cloud listings (`inspect`, `schema`, `diff`) |
+| Deletion Vectors (DVs) | ✅ | Keyed by `(canonical_path, dv_unique_id)`, DV file & row counts |
+| Column Mapping (`id` & `name` modes) | ✅ | Detects column renames via `delta.columnMapping.id` |
+| Liquid Clustering (`delta.clustering`) | ✅ | Extracts clustering columns from `domainMetadata` |
+| Type Widening & Recursive Schema Diff | ✅ | Nested `struct`/`array`/`map`, safe widenings vs. `[BREAKING]` |
+| Tombstone Retention (`deletedFileRetentionDuration`) | ✅ | Tracks active & expired tombstones and reclaimable bytes |
+| Protocol Features (`readerFeatures` / `writerFeatures`) | ✅ | Reported in `inspect` table & JSON output |
 
-## License
+---
 
-MIT. See [LICENSE](LICENSE).
+## Commands & Exit Codes
+
+| Command | What it does | Key flags |
+| :--- | :--- | :--- |
+| `inspect <path>` | Table health, file skew, tombstones, DVs, checkpoints, clustering & protocol | `--version <n>`, `--fail-on-issues` |
+| `diff <path>` | Logical & physical file deltas, partition diffs, recursive schema diffs | `--v1 <n> --v2 <n>`, `--schema-only`, `--files-only`, `--fail-on-breaking` |
+| `lineage <path>` | Writer attribution, row counts & operation timeline | `--last <n>`, `--since <YYYY-MM-DD>`, `--op <ops>`, `--user <u>` |
+| `audit <path>` | Compliance audit trail filterable by date range, op, and user | `--since <YYYY-MM-DD>`, `--until <YYYY-MM-DD>`, `--op <ops>`, `--user <u>` |
+| `schema <path>` | Active column layout or full recursive schema evolution history | `--history`, `--at <v>` |
+| `config` | Manage user settings and local opt-in telemetry | `show`, `path`, `metrics`, `set <key> <value>` |
+
+**Global flags**: `--json` (machine-readable JSON), `--plain` (ANSI-free, honors `NO_COLOR` and non-TTY stdout), `--no-header`, `-v` / `--verbose` (checkpoint discovery and parse warnings to stderr).
+
+**Exit codes**:
+- `0` — Success
+- `1` — Error (invalid arguments, missing table/version, version gap, storage/auth error)
+- `2` — CI gate triggered (`inspect --fail-on-issues` detected health issues, or `diff --fail-on-breaking` detected breaking schema changes)
+
+### GitHub Actions CI/CD Gate Example
+
+```yaml
+- name: Gate on Delta table health & breaking schema changes
+  run: |
+    deltalens inspect s3://my-bucket/warehouse/transactions --plain --fail-on-issues
+    deltalens diff s3://my-bucket/warehouse/transactions --v1 "$PREV_VER" --v2 "$CURR_VER" --fail-on-breaking
+```
+
+---
+
+## Cloud Storage Authentication
+
+DeltaLens supports `s3://`, `s3a://`, `s3n://`, `gs://`, `az://`, `abfs://`, `abfss://`, and `file://` URIs via `object_store`.
+
+### AWS S3 (`s3://`, `s3a://`, `s3n://`)
+
+| Setting | Environment variable(s) |
+| :--- | :--- |
+| Access keys | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN` |
+| IAM / OIDC roles | Automatic on EC2/ECS/EKS, or `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN` |
+| Region | `AWS_REGION` or `AWS_DEFAULT_REGION` |
+| Custom S3-compatible endpoint | `AWS_ENDPOINT` (MinIO, Cloudflare R2, LocalStack) |
+| Plain HTTP (local dev) | `AWS_ALLOW_HTTP=true` |
+
+*(Note: `object_store` reads environment variables and IMDS/OIDC directly; export credentials from named AWS CLI profiles into the environment if needed.)*
+
+### Google Cloud Storage (`gs://`)
+
+| Setting | Environment variable(s) |
+| :--- | :--- |
+| Service account JSON key | `GOOGLE_SERVICE_ACCOUNT` or `GOOGLE_APPLICATION_CREDENTIALS` |
+| Compute metadata | Automatic on GCE / GKE via GCP metadata service |
+
+### Azure Data Lake / Blob Storage (`az://`, `abfs://`, `abfss://`)
+
+| Setting | Environment variable(s) |
+| :--- | :--- |
+| Storage account & key | `AZURE_STORAGE_ACCOUNT_NAME`, `AZURE_STORAGE_ACCOUNT_KEY` |
+| Shared Access Signature (SAS) | `AZURE_STORAGE_ACCOUNT_NAME`, `AZURE_STORAGE_SAS_KEY` |
+| Service Principal | `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_TENANT_ID` |
+| Managed Identity / Azure CLI | Automatic on Azure compute or active Azure CLI login |
+
+*(For `abfss://container@account.dfs.core.windows.net/path`, the storage account name is also parsed automatically from the URI.)*
+
+---
+
+## Rust Library Usage
+
+Add `deltalens` to your `Cargo.toml` (`cargo add deltalens`, or `--no-default-features` for local-only):
+
+```rust
+use deltalens::{storage_for, DeltaLogReader, DiffAnalyzer, HealthAnalyzer, TableState};
+
+fn main() -> Result<(), deltalens::DeltaLensError> {
+    let (storage, root) = storage_for("./transactions")?;
+    let reader = DeltaLogReader::new(storage, &root)?;
+    let snapshot = reader.read_snapshot_log(None)?;
+    let stats = HealthAnalyzer::analyze_snapshot(&snapshot);
+    println!("v{}: {} files, skew {:.2}", stats.current_version, stats.health.total_files, stats.health.skew_score);
+    let (snap_v0, after, _) = reader.read_diff_logs(0, stats.current_version)?;
+    let diff = DiffAnalyzer::diff_from_state(0, TableState::from_snapshot(&snap_v0), &after);
+    println!("breaking schema changes: {}", diff.has_breaking_schema_changes);
+    Ok(())
+}
+```
+
+Try the included runnable example right away:
+
+```bash
+cargo run --example inspect_table --locked
+```
+
+---
+
+## Benchmarks
+
+Reproducible Criterion benchmarks cover both full-range commit parsing (`read_range`) and checkpoint-accelerated snapshot health inspection (`read_snapshot_log` + `HealthAnalyzer::analyze_snapshot`) across small (100 commits / 1,000 adds), medium (1,000 commits / 50,000 adds), and large (5,000 commits / 500,000 adds) synthetic tables:
+
+```bash
+python3 scripts/gen_fixture.py
+cargo bench --bench log_parsing --locked
+```
+
+---
+
+## Security & Read-Only Guarantees
+
+- **Strictly read-only**: DeltaLens never writes, deletes, or modifies any target table or `_delta_log/` file.
+- **Zero unsolicited network traffic**: Outbound requests occur only when you explicitly pass a cloud URI (`s3://`, `gs://`, `az://`, `abfss://`). Build with `--no-default-features` to strip all cloud/HTTP code at compile time.
+- **TOCTOU-free local containment**: Uses `openat(..., O_NOFOLLOW)` with a pinned `O_DIRECTORY` root descriptor on Linux/macOS and handle-pinned `GetFinalPathNameByHandleW` verification on Windows across `read`, `list`, `exists`, and `is_dir`.
+- **Cloud & sidecar containment**: Rejects path traversal (`..`, `.`), empty segments, backslashes, NUL bytes, and prefix/bucket escapes on both V2 `_sidecars/` paths and cloud object keys.
+- **Strict installer verification & local-only telemetry**: Installers require valid `.sha256` digests before extracting binaries; opt-in telemetry (`deltalens config set telemetry true`) writes solely to a local JSONL file and never phones home.
+
+See [SECURITY.md](SECURITY.md) for our threat model and private vulnerability reporting process.
+
+---
+
+## Contributing & License
+
+- Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md), [ARCHITECTURE.md](ARCHITECTURE.md), [CHANGELOG.md](CHANGELOG.md), and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+- Licensed under the [MIT License](LICENSE).

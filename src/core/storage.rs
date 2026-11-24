@@ -102,7 +102,7 @@ impl LocalStorage {
         }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     fn resolve_path(&self, path: &str) -> Result<PathBuf, DeltaLensError> {
         let relative = Path::new(path);
         if relative.is_absolute()
@@ -223,7 +223,34 @@ impl StorageBackend for LocalStorage {
                 Err(e) => Err(e),
             }
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(windows)]
+        {
+            // Mirror Unix O_NOFOLLOW parity using handle-pinned opens verified
+            // with GetFinalPathNameByHandleW. Opening a directory without
+            // FILE_FLAG_BACKUP_SEMANTICS returns PermissionDenied on Windows, so
+            // retry via open_table_directory_windows in that case.
+            match open_table_file_windows(&self.root, path) {
+                Ok(_) => Ok(true),
+                Err(DeltaLensError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(false)
+                }
+                Err(DeltaLensError::Io(ref e))
+                    if e.kind() == std::io::ErrorKind::PermissionDenied =>
+                {
+                    match open_table_directory_windows(&self.root, path) {
+                        Ok(_) => Ok(true),
+                        Err(DeltaLensError::Io(ref e))
+                            if e.kind() == std::io::ErrorKind::NotFound =>
+                        {
+                            Ok(false)
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                Err(e) => Err(e),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             Ok(self.resolve_path(path)?.exists())
         }
@@ -243,7 +270,19 @@ impl StorageBackend for LocalStorage {
                 Err(e) => Err(e),
             }
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(windows)]
+        {
+            // FILE_FLAG_BACKUP_SEMANTICS can open regular files as well as
+            // directories; query metadata on the already-pinned handle.
+            match open_table_directory_windows(&self.root, path) {
+                Ok(handle) => Ok(handle.metadata()?.is_dir()),
+                Err(DeltaLensError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(false)
+                }
+                Err(e) => Err(e),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             Ok(self.resolve_path(path)?.is_dir())
         }
@@ -261,7 +300,9 @@ fn open_table_file_windows(root: &Path, path: &str) -> Result<std::fs::File, Del
         || relative.components().any(|component| {
             matches!(
                 component,
-                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
             )
         })
     {
@@ -331,7 +372,9 @@ fn open_table_directory_windows(root: &Path, path: &str) -> Result<std::fs::File
         || relative.components().any(|component| {
             matches!(
                 component,
-                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
             )
         })
     {
@@ -782,38 +825,69 @@ impl ObjectStoreBackend {
     }
 
     /// Resolve either a full URI (`scheme://bucket/key`) or a relative subpath (`_delta_log/...`)
-    /// into an object store key. Relative paths ALWAYS prepend `self.prefix`.
-    /// When a full URI matches this backend's scheme & bucket and `self.prefix` is non-empty,
-    /// the key MUST stay beneath `self.prefix` (otherwise `InvalidInput` is returned).
+    /// into an object store key. Relative paths ALWAYS prepend `self.prefix` and reject
+    /// path traversal (`..`, `.`), NUL bytes, backslashes, leading slashes, and empty segments.
+    /// Full URIs must match this backend's scheme and bucket and stay beneath `self.prefix`.
     pub fn resolve_key(&self, path: &str) -> Result<String, DeltaLensError> {
+        if path.contains('\0') || path.contains('\\') {
+            return Err(DeltaLensError::InvalidInput(format!(
+                "Object path '{path}' contains forbidden control or backslash characters"
+            )));
+        }
+
         if let Some((scheme, rest)) = split_uri_scheme(path) {
-            if let Some((authority, key)) = rest.split_once('/') {
-                if scheme.eq_ignore_ascii_case(&self.scheme)
-                    && authority.eq_ignore_ascii_case(&self.bucket)
-                {
-                    let clean_key = key.trim_start_matches('/');
-                    if clean_key.split('/').any(|seg| seg == "..") {
-                        return Err(DeltaLensError::InvalidInput(format!(
-                            "Object URI '{path}' contains parent path traversal"
-                        )));
-                    }
-                    if !self.prefix.is_empty() {
-                        let within_prefix = clean_key == self.prefix
-                            || clean_key
-                                .strip_prefix(&self.prefix)
-                                .is_some_and(|tail| tail.starts_with('/'));
-                        if !within_prefix {
-                            return Err(DeltaLensError::InvalidInput(format!(
-                                "Object URI '{path}' escapes configured table prefix '{}'",
-                                self.prefix
-                            )));
-                        }
-                    }
-                    return Ok(clean_key.to_string());
+            let (authority, key) = rest.split_once('/').unwrap_or((rest, ""));
+            if !scheme.eq_ignore_ascii_case(&self.scheme)
+                || !authority.eq_ignore_ascii_case(&self.bucket)
+            {
+                return Err(DeltaLensError::InvalidInput(format!(
+                    "Object URI '{path}' does not match configured bucket '{}://{}'",
+                    self.scheme, self.bucket
+                )));
+            }
+
+            let clean_key = key.trim_start_matches('/').trim_end_matches('/');
+            if !clean_key.is_empty()
+                && clean_key
+                    .split('/')
+                    .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+            {
+                return Err(DeltaLensError::InvalidInput(format!(
+                    "Object URI '{path}' contains invalid or parent traversal path segments"
+                )));
+            }
+            if !self.prefix.is_empty() {
+                let within_prefix = clean_key == self.prefix
+                    || clean_key
+                        .strip_prefix(&self.prefix)
+                        .is_some_and(|tail| tail.starts_with('/'));
+                if !within_prefix {
+                    return Err(DeltaLensError::InvalidInput(format!(
+                        "Object URI '{path}' escapes configured table prefix '{}'",
+                        self.prefix
+                    )));
                 }
             }
+            return Ok(clean_key.to_string());
         }
-        Ok(self.object_key(path))
+
+        if path.is_empty() {
+            return Ok(self.prefix.clone());
+        }
+
+        let trimmed = path.trim_end_matches('/');
+        if trimmed.is_empty()
+            || trimmed.starts_with('/')
+            || trimmed
+                .split('/')
+                .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+        {
+            return Err(DeltaLensError::InvalidInput(format!(
+                "Relative object path '{path}' contains invalid or parent traversal path segments"
+            )));
+        }
+
+        Ok(self.object_key(trimmed))
     }
 
     fn map_store_error(action: &str, target: &str, err: object_store::Error) -> DeltaLensError {
@@ -1445,5 +1519,94 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(batch.len(), 2);
+    }
+
+    #[cfg(feature = "cloud")]
+    #[test]
+    fn test_object_store_resolve_key_rejects_relative_traversal() {
+        use object_store::memory::InMemory;
+
+        let backend = ObjectStoreBackend::from_object_store(
+            Arc::new(InMemory::new()),
+            "s3",
+            "my-bucket",
+            "warehouse/sales",
+            "s3://my-bucket/warehouse/sales".to_string(),
+        );
+
+        // Valid relative paths stay under `self.prefix`.
+        assert_eq!(backend.resolve_key("").unwrap(), "warehouse/sales");
+        assert_eq!(
+            backend.resolve_key("_delta_log").unwrap(),
+            "warehouse/sales/_delta_log"
+        );
+        assert_eq!(
+            backend.resolve_key("_delta_log/").unwrap(),
+            "warehouse/sales/_delta_log"
+        );
+        assert_eq!(
+            backend
+                .resolve_key("_delta_log/00000000000000000000.json")
+                .unwrap(),
+            "warehouse/sales/_delta_log/00000000000000000000.json"
+        );
+
+        // Parent traversal, dot segments, empty segments, leading slashes, backslashes, NUL bytes,
+        // and mismatched URI schemes/buckets MUST all be rejected.
+        for bad in [
+            "..",
+            "../other/secret.json",
+            "_delta_log/../../secret.json",
+            "_delta_log/../_delta_log/00000000000000000000.json",
+            "_delta_log/./00000000000000000000.json",
+            "_delta_log//00000000000000000000.json",
+            "/",
+            "/_delta_log/00000000000000000000.json",
+            "_delta_log\\..\\secret.json",
+            "_delta_log/00000000000000000000.json\0",
+            "s3://other-bucket/warehouse/sales/_delta_log/00000000000000000000.json",
+            "gs://my-bucket/warehouse/sales/_delta_log/00000000000000000000.json",
+            "s3://my-bucket/warehouse/sales/_delta_log/../secret.json",
+            "s3://my-bucket/warehouse/sales/_delta_log//secret.json",
+        ] {
+            assert!(
+                matches!(
+                    backend.resolve_key(bad),
+                    Err(DeltaLensError::InvalidInput(_))
+                ),
+                "Expected InvalidInput for path: {bad:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_exists_and_is_dir_handle_pinned() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("table");
+        let log_dir = root.join("_delta_log");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(log_dir.join("00000000000000000000.json"), b"{}\n").unwrap();
+        std::fs::write(tmp.path().join("outside.json"), b"secret").unwrap();
+
+        let storage = LocalStorage::new(root.to_string_lossy().to_string());
+        assert!(storage.exists("_delta_log").unwrap());
+        assert!(storage.is_dir("_delta_log").unwrap());
+        assert!(storage
+            .exists("_delta_log/00000000000000000000.json")
+            .unwrap());
+        assert!(!storage
+            .is_dir("_delta_log/00000000000000000000.json")
+            .unwrap());
+        assert!(!storage.exists("_delta_log/missing.json").unwrap());
+        assert!(!storage.is_dir("_delta_log/missing").unwrap());
+        assert!(matches!(
+            storage.exists("../outside.json"),
+            Err(DeltaLensError::Storage(_))
+        ));
+        assert!(matches!(
+            storage.is_dir("../outside.json"),
+            Err(DeltaLensError::Storage(_))
+        ));
     }
 }

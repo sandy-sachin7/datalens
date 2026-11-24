@@ -47,6 +47,9 @@ jobs:
       - name: cargo test
         run: cargo test --locked
 
+      - name: cargo test (local-only, no default features)
+        run: cargo test --no-default-features --locked
+
   security:
     name: Security audit
     runs-on: ubuntu-latest
@@ -79,3 +82,8 @@ jobs:
 
       - name: cargo clippy
         run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: cargo doc (strict warnings)
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps --all-features --locked

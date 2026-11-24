@@ -2,13 +2,28 @@
 name = "deltalens"
 version = "2.0.0"
 edition = "2021"
+rust-version = "1.80"
 description = "Standalone CLI to inspect Delta Lake tables without Spark, JVM, or Python"
 license = "MIT"
+homepage = "https://github.com/sandy-sachin7/datalens#readme"
 repository = "https://github.com/sandy-sachin7/datalens"
+documentation = "https://docs.rs/deltalens"
 readme = "README.md"
 keywords = ["delta-lake", "databricks", "data-engineering", "observability", "cli"]
 categories = ["command-line-utilities", "development-tools"]
-include = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
+include = [
+    "src/**",
+    "tests/**",
+    "examples/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [lib]
 name = "deltalens"

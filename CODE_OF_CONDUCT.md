@@ -27,9 +27,15 @@ Examples of unacceptable behavior:
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported by opening an issue or contacting the maintainers. All complaints
-will be reviewed and investigated promptly and fairly.
+Instances of abusive, harassing, or otherwise unacceptable behavior should be
+reported **privately** — please do **not** open a public GitHub issue for
+harassment or personal-safety complaints. Report incidents directly to the
+project maintainers via email at `conduct@deltalens.dev` or through a private
+message to the repository maintainer (`@sandy-sachin7`).
+
+All complaints will be reviewed and investigated promptly, confidentially, and
+fairly. Maintainers are obligated to respect the privacy and security of the
+reporter of any incident.
 
 ## Attribution
 
