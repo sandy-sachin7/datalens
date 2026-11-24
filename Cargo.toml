@@ -62,7 +62,7 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "1"
 
 # Human readable sizes
-bytesize = "1"
+bytesize = "2"
 
 # Parquet checkpoint reading (classic, multi-part, V2 & sidecars)
 bytes = "1"
