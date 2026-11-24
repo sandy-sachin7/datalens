@@ -10,7 +10,7 @@ src/
 ├── main.rs                     # CLI bootstrap, exit codes (0 / 1 / 2), opt-in telemetry hook
 ├── error.rs                    # Structured DeltaLensError (thiserror)
 ├── cli/
-│   ├── mod.rs                  # Clap command definitions & global flags
+│   ├── args.rs                 # Clap command definitions & global flags
 │   ├── output_opts.rs          # OutputOpts & CommandOutcome (exit code propagation)
 │   └── commands/               # inspect, diff, lineage, audit, schema, config
 ├── core/
