@@ -5,7 +5,7 @@
 | Version | Supported | Notes |
 | :--- | :--- | :--- |
 | `2.x` | Yes | Active maintenance, security patches, and protocol hardening |
-| `1.x` | No | End of life — upgrade to `2.0.0` or later |
+| `1.x` | No | End of life — upgrade to `2.0.1` or later |
 
 ## Reporting a Vulnerability
 

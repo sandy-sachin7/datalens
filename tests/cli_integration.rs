@@ -447,12 +447,12 @@ fn test_parquet_checkpoint_table_cli_end_to_end() {
 }
 
 #[test]
-fn test_cli_version_is_2_0_0_and_checkpoint_horizon_passes_fail_on_issues() {
+fn test_cli_version_is_2_0_1_and_checkpoint_horizon_passes_fail_on_issues() {
     deltalens_cmd()
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("2.0.0"));
+        .stdout(predicate::str::contains("2.0.1"));
 
     // High-version table (>100) with checkpoint at v150, commit v151, no post-checkpoint VACUUM,
     // and no expired tombstones must pass `inspect --fail-on-issues` (exit 0) and display
