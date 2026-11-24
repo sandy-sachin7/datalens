@@ -12,7 +12,19 @@ impl HealthAnalyzer {
     pub fn analyze_snapshot(snapshot: &SnapshotLog) -> TableStats {
         let state = TableState::from_snapshot(snapshot);
         let health = Self::compute_health(&state);
-        let tombstones = state.tombstone_info();
+        let created_timestamp = Self::find_created_ts(&state, &snapshot.commits);
+        let last_modified_timestamp = Self::find_last_modified_ts(&state, &snapshot.commits);
+        let retention_ms = state.deleted_file_retention_ms();
+        let newest_tombstone_ts = state
+            .active_tombstones
+            .values()
+            .filter_map(|r| r.deletion_timestamp)
+            .filter(|&t| t > 0)
+            .max();
+        let reference_ts = last_modified_timestamp
+            .map(|ts| ts.max(newest_tombstone_ts.unwrap_or(ts)))
+            .or_else(|| Some(chrono::Utc::now().timestamp_millis()));
+        let tombstones = state.tombstone_info_with_retention(retention_ms, reference_ts);
         let mut maintenance = Self::compute_maintenance(&snapshot.commits);
         maintenance.last_checkpoint_version = snapshot.checkpoint_version;
         maintenance.clustering_columns = state.clustering_columns();
@@ -32,9 +44,6 @@ impl HealthAnalyzer {
             .map(|s| s.fields.len())
             .unwrap_or(0);
         let schema_change_count = SchemaTracker::history_from_snapshot(snapshot).len();
-
-        let created_timestamp = Self::find_created_ts(&state, &snapshot.commits);
-        let last_modified_timestamp = Self::find_last_modified_ts(&state, &snapshot.commits);
 
         let (min_reader_version, min_writer_version, reader_features, writer_features) =
             match &state.protocol {
@@ -96,7 +105,12 @@ impl HealthAnalyzer {
             .iter()
             .fold(0i64, |acc, &size| acc.saturating_add(size));
         let avg_size = if total_files > 0 {
-            total_size / total_files as i64
+            let sum_i128: i128 = sizes.iter().map(|&s| i128::from(s)).sum();
+            i64::try_from(sum_i128 / total_files as i128).unwrap_or(if sum_i128 < 0 {
+                i64::MIN
+            } else {
+                i64::MAX
+            })
         } else {
             0
         };
@@ -118,7 +132,7 @@ impl HealthAnalyzer {
         for add in state.active_files.values() {
             if let Some(dv) = &add.deletion_vector {
                 deletion_vector_files += 1;
-                deleted_rows_in_dvs += dv.cardinality;
+                deleted_rows_in_dvs = deleted_rows_in_dvs.saturating_add(dv.cardinality);
             }
         }
 
@@ -142,7 +156,8 @@ impl HealthAnalyzer {
         if sizes.len() < 2 {
             return 0.0;
         }
-        let mean = sizes.iter().sum::<i64>() as f64 / sizes.len() as f64;
+        let sum: i128 = sizes.iter().map(|&s| i128::from(s)).sum();
+        let mean = sum as f64 / sizes.len() as f64;
         if mean <= 0.0 {
             return 0.0;
         }
@@ -469,5 +484,184 @@ mod tests {
             "Single-file table should not trigger small-file issue: {:?}",
             stats.health_issues()
         );
+    }
+
+    #[test]
+    fn test_health_saturating_math_on_huge_file_sizes_and_dv_cardinality() {
+        use crate::core::model::action::DeletionVectorDescriptor;
+
+        let huge = i64::MAX / 2;
+        assert_eq!(HealthAnalyzer::compute_skew_score(&[huge, huge, huge]), 0.0);
+
+        let dv = DeletionVectorDescriptor {
+            storage_type: "u".to_string(),
+            path_or_inline_dv: "abc".to_string(),
+            offset: Some(1),
+            size_in_bytes: 16,
+            cardinality: huge,
+        };
+        let entries = vec![CommitEntry {
+            version: 0,
+            path: "0.json".to_string(),
+            actions: vec![
+                Action::Add(AddAction {
+                    path: "a.parquet".to_string(),
+                    size: huge,
+                    modification_time: 1000,
+                    data_change: true,
+                    partition_values: HashMap::new(),
+                    stats: None,
+                    tags: None,
+                    deletion_vector: Some(dv.clone()),
+                }),
+                Action::Add(AddAction {
+                    path: "b.parquet".to_string(),
+                    size: huge,
+                    modification_time: 1000,
+                    data_change: true,
+                    partition_values: HashMap::new(),
+                    stats: None,
+                    tags: None,
+                    deletion_vector: Some(dv.clone()),
+                }),
+                Action::Add(AddAction {
+                    path: "c.parquet".to_string(),
+                    size: huge,
+                    modification_time: 1000,
+                    data_change: true,
+                    partition_values: HashMap::new(),
+                    stats: None,
+                    tags: None,
+                    deletion_vector: Some(dv),
+                }),
+            ],
+        }];
+
+        let stats = HealthAnalyzer::analyze(&entries);
+        assert_eq!(stats.health.total_size, i64::MAX);
+        assert_eq!(stats.health.avg_file_size, huge);
+        assert_eq!(stats.health.skew_score, 0.0);
+        assert_eq!(stats.health.deleted_rows_in_dvs, i64::MAX);
+    }
+
+    #[test]
+    fn test_checkpoint_horizon_avoids_false_positive_and_honors_retention_duration() {
+        use crate::core::model::action::{Format, MetaDataAction};
+
+        let day_ms: i64 = 24 * 60 * 60 * 1000;
+        let now_ts: i64 = 1_750_000_000_000;
+
+        let make_snapshot = |retention: Option<&str>, tombstone_age_days: Option<i64>| {
+            let mut config = HashMap::new();
+            if let Some(r) = retention {
+                config.insert(
+                    "delta.deletedFileRetentionDuration".to_string(),
+                    Some(r.to_string()),
+                );
+            }
+            let mut ckpt_actions = vec![
+                Action::MetaData(MetaDataAction {
+                    id: "tbl".to_string(),
+                    name: None,
+                    description: None,
+                    format: Format::default(),
+                    schema_string: r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{}}]}"#.to_string(),
+                    partition_columns: vec![],
+                    configuration: config,
+                    created_time: Some(now_ts - 30 * day_ms),
+                }),
+                Action::Add(AddAction {
+                    path: "big1.parquet".to_string(),
+                    size: 64 * 1024 * 1024,
+                    modification_time: now_ts - day_ms,
+                    data_change: false,
+                    partition_values: HashMap::new(),
+                    stats: None,
+                    tags: None,
+                    deletion_vector: None,
+                }),
+                Action::Add(AddAction {
+                    path: "big2.parquet".to_string(),
+                    size: 64 * 1024 * 1024,
+                    modification_time: now_ts - day_ms,
+                    data_change: false,
+                    partition_values: HashMap::new(),
+                    stats: None,
+                    tags: None,
+                    deletion_vector: None,
+                }),
+            ];
+            if let Some(age_days) = tombstone_age_days {
+                ckpt_actions.push(Action::Remove(RemoveAction {
+                    path: "old.parquet".to_string(),
+                    deletion_timestamp: Some(now_ts - age_days * day_ms),
+                    data_change: true,
+                    extended_file_metadata: Some(true),
+                    size: Some(10_000_000),
+                    partition_values: None,
+                    tags: None,
+                    deletion_vector: None,
+                }));
+            }
+            SnapshotLog {
+                target_version: 151,
+                checkpoint_version: Some(150),
+                checkpoint_actions: ckpt_actions,
+                commits: vec![CommitEntry {
+                    version: 151,
+                    path: "00000000000000000151.json".to_string(),
+                    actions: vec![Action::CommitInfo(CommitInfoAction {
+                        timestamp: now_ts,
+                        operation: "WRITE".to_string(),
+                        operation_parameters: HashMap::new(),
+                        notebook_info: None,
+                        job: None,
+                        cluster_id: None,
+                        user_id: None,
+                        user_name: None,
+                        operation_metrics: None,
+                        engine_info: None,
+                        is_blind_append: None,
+                        txn_id: None,
+                    })],
+                }],
+                warnings: Vec::new(),
+                files_read: 2,
+            }
+        };
+
+        // 1. Checkpointed v151 table with NO tombstones and NO post-checkpoint VACUUM/OPTIMIZE:
+        //    must NOT falsely trigger `--fail-on-issues`!
+        let clean = HealthAnalyzer::analyze_snapshot(&make_snapshot(None, None));
+        assert!(
+            clean.health_issues().is_empty(),
+            "Checkpointed table without expired tombstones should have 0 issues: {:?}",
+            clean.health_issues()
+        );
+
+        // 2. Tombstone is 3 days old (within default 7-day retention): still 0 issues!
+        let within_default = HealthAnalyzer::analyze_snapshot(&make_snapshot(None, Some(3)));
+        assert_eq!(within_default.tombstones.expired_tombstones, 0);
+        assert!(within_default.health_issues().is_empty());
+
+        // 3. Tombstone is 10 days old (exceeds default 7-day retention): flags VACUUM issue!
+        let expired_default = HealthAnalyzer::analyze_snapshot(&make_snapshot(None, Some(10)));
+        assert_eq!(expired_default.tombstones.expired_tombstones, 1);
+        assert_eq!(expired_default.health_issues().len(), 1);
+        assert!(expired_default.health_issues()[0].contains("expired tombstones"));
+
+        // 4. Same 10-day-old tombstone, but custom `interval 30 days` retention: 0 issues!
+        let custom_long =
+            HealthAnalyzer::analyze_snapshot(&make_snapshot(Some("interval 30 days"), Some(10)));
+        assert_eq!(custom_long.tombstones.expired_tombstones, 0);
+        assert_eq!(custom_long.tombstones.retention_duration_ms, 30 * day_ms);
+        assert!(custom_long.health_issues().is_empty());
+
+        // 5. 2-day-old tombstone with short `interval 24 hours` retention: flags VACUUM issue!
+        let custom_short =
+            HealthAnalyzer::analyze_snapshot(&make_snapshot(Some("interval 24 hours"), Some(2)));
+        assert_eq!(custom_short.tombstones.expired_tombstones, 1);
+        assert_eq!(custom_short.tombstones.retention_duration_ms, day_ms);
+        assert_eq!(custom_short.health_issues().len(), 1);
     }
 }

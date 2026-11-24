@@ -43,11 +43,11 @@ impl LineageTracer {
                     let key = FileKey::from_remove(r);
                     let prior_size = known_sizes.remove(&key);
                     let sz = r.size.or(prior_size).unwrap_or(0);
-                    physical_files_removed += 1;
-                    physical_bytes_removed += sz;
+                    physical_files_removed = physical_files_removed.saturating_add(1);
+                    physical_bytes_removed = physical_bytes_removed.saturating_add(sz);
                     if r.data_change {
-                        files_removed += 1;
-                        bytes_removed += sz;
+                        files_removed = files_removed.saturating_add(1);
+                        bytes_removed = bytes_removed.saturating_add(sz);
                     }
                     if let Some(ts) = r.deletion_timestamp {
                         if ts > 0 {
@@ -74,13 +74,13 @@ impl LineageTracer {
                 };
                 known_sizes.insert(key, a.size);
 
-                physical_files_added += 1;
-                physical_bytes_added += a.size;
+                physical_files_added = physical_files_added.saturating_add(1);
+                physical_bytes_added = physical_bytes_added.saturating_add(a.size);
                 if a.data_change {
-                    files_added += 1;
-                    bytes_added += a.size;
+                    files_added = files_added.saturating_add(1);
+                    bytes_added = bytes_added.saturating_add(a.size);
                     if let Some(nr) = a.num_records_from_stats() {
-                        stats_rows_sum += nr;
+                        stats_rows_sum = stats_rows_sum.saturating_add(nr);
                         has_stats_rows = true;
                     }
                 }
@@ -228,7 +228,7 @@ impl LineageTracer {
         let deleted = get_i64("numTargetRowsDeleted");
         let updated = get_i64("numTargetRowsUpdated");
         if inserted.is_some() || deleted.is_some() || updated.is_some() {
-            let net = inserted.unwrap_or(0) - deleted.unwrap_or(0);
+            let net = inserted.unwrap_or(0).saturating_sub(deleted.unwrap_or(0));
             if net != 0 || updated.unwrap_or(0) == 0 {
                 return Some(net);
             }
@@ -237,7 +237,7 @@ impl LineageTracer {
 
         // 3. Spark / delta-rs DELETE (negate to show rows removed)
         if let Some(del) = get_i64("numDeletedRows").or_else(|| get_i64("num_deleted_rows")) {
-            return Some(-del.abs());
+            return Some(del.saturating_abs().saturating_neg());
         }
 
         // 4. Spark / delta-rs UPDATE
@@ -479,5 +479,92 @@ mod tests {
 
         assert_eq!(traced[1].writer, "notebook_🚀αβγδεζη");
         assert_eq!(traced[1].num_output_rows, Some(-15));
+    }
+
+    #[test]
+    fn test_lineage_saturating_math_on_huge_file_sizes() {
+        let huge = i64::MAX / 2;
+        let huge_rows = format!(r#"{{"numRecords":{huge}}}"#);
+        let entries = vec![
+            CommitEntry {
+                version: 0,
+                path: "0.json".to_string(),
+                actions: vec![
+                    Action::Add(AddAction {
+                        path: "a.parquet".to_string(),
+                        size: huge,
+                        modification_time: 100,
+                        data_change: true,
+                        partition_values: HashMap::new(),
+                        stats: Some(huge_rows.clone()),
+                        tags: None,
+                        deletion_vector: None,
+                    }),
+                    Action::Add(AddAction {
+                        path: "b.parquet".to_string(),
+                        size: huge,
+                        modification_time: 100,
+                        data_change: true,
+                        partition_values: HashMap::new(),
+                        stats: Some(huge_rows.clone()),
+                        tags: None,
+                        deletion_vector: None,
+                    }),
+                    Action::Add(AddAction {
+                        path: "c.parquet".to_string(),
+                        size: huge,
+                        modification_time: 100,
+                        data_change: true,
+                        partition_values: HashMap::new(),
+                        stats: Some(huge_rows),
+                        tags: None,
+                        deletion_vector: None,
+                    }),
+                ],
+            },
+            CommitEntry {
+                version: 1,
+                path: "1.json".to_string(),
+                actions: vec![
+                    Action::Remove(crate::core::model::action::RemoveAction {
+                        path: "a.parquet".to_string(),
+                        deletion_timestamp: Some(200),
+                        data_change: true,
+                        extended_file_metadata: None,
+                        size: None,
+                        partition_values: None,
+                        tags: None,
+                        deletion_vector: None,
+                    }),
+                    Action::Remove(crate::core::model::action::RemoveAction {
+                        path: "b.parquet".to_string(),
+                        deletion_timestamp: Some(200),
+                        data_change: true,
+                        extended_file_metadata: None,
+                        size: None,
+                        partition_values: None,
+                        tags: None,
+                        deletion_vector: None,
+                    }),
+                    Action::Remove(crate::core::model::action::RemoveAction {
+                        path: "c.parquet".to_string(),
+                        deletion_timestamp: Some(200),
+                        data_change: true,
+                        extended_file_metadata: None,
+                        size: None,
+                        partition_values: None,
+                        tags: None,
+                        deletion_vector: None,
+                    }),
+                ],
+            },
+        ];
+
+        let traced = LineageTracer::trace(&entries);
+        assert_eq!(traced[0].bytes_added, i64::MAX);
+        assert_eq!(traced[0].physical_bytes_added, i64::MAX);
+        assert_eq!(traced[0].num_output_rows, Some(i64::MAX));
+        assert_eq!(traced[1].bytes_removed, i64::MAX);
+        assert_eq!(traced[1].physical_bytes_removed, i64::MAX);
     }
 }

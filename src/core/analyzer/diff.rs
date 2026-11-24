@@ -63,14 +63,16 @@ impl DiffAnalyzer {
 
         for entry in entries_after {
             let delta = state.apply_commit(entry);
-            files_added += delta.logical_files_added;
-            files_removed += delta.logical_files_removed;
-            bytes_added += delta.logical_bytes_added;
-            bytes_removed += delta.logical_bytes_removed;
-            physical_files_added += delta.physical_files_added;
-            physical_files_removed += delta.physical_files_removed;
-            physical_bytes_added += delta.physical_bytes_added;
-            physical_bytes_removed += delta.physical_bytes_removed;
+            files_added = files_added.saturating_add(delta.logical_files_added);
+            files_removed = files_removed.saturating_add(delta.logical_files_removed);
+            bytes_added = bytes_added.saturating_add(delta.logical_bytes_added);
+            bytes_removed = bytes_removed.saturating_add(delta.logical_bytes_removed);
+            physical_files_added = physical_files_added.saturating_add(delta.physical_files_added);
+            physical_files_removed =
+                physical_files_removed.saturating_add(delta.physical_files_removed);
+            physical_bytes_added = physical_bytes_added.saturating_add(delta.physical_bytes_added);
+            physical_bytes_removed =
+                physical_bytes_removed.saturating_add(delta.physical_bytes_removed);
 
             for action in &entry.actions {
                 if let Action::CommitInfo(ci) = action {
@@ -365,5 +367,126 @@ mod tests {
         assert!(change.removed_columns.is_empty());
         assert!(change.modified_columns.is_empty());
         assert!(!change.has_breaking_changes);
+    }
+
+    #[test]
+    fn test_diff_saturating_math_on_huge_file_sizes() {
+        let huge = i64::MAX / 2;
+        let before = vec![CommitEntry {
+            version: 0,
+            path: "0.json".to_string(),
+            actions: vec![
+                Action::Add(AddAction {
+                    path: "a.parquet".to_string(),
+                    size: huge,
+                    modification_time: 100,
+                    data_change: true,
+                    partition_values: HashMap::new(),
+                    stats: None,
+                    tags: None,
+                    deletion_vector: None,
+                }),
+                Action::Add(AddAction {
+                    path: "b.parquet".to_string(),
+                    size: huge,
+                    modification_time: 100,
+                    data_change: true,
+                    partition_values: HashMap::new(),
+                    stats: None,
+                    tags: None,
+                    deletion_vector: None,
+                }),
+                Action::Add(AddAction {
+                    path: "c.parquet".to_string(),
+                    size: huge,
+                    modification_time: 100,
+                    data_change: true,
+                    partition_values: HashMap::new(),
+                    stats: None,
+                    tags: None,
+                    deletion_vector: None,
+                }),
+            ],
+        }];
+        let after = vec![
+            CommitEntry {
+                version: 1,
+                path: "1.json".to_string(),
+                actions: vec![
+                    Action::Add(AddAction {
+                        path: "d.parquet".to_string(),
+                        size: huge,
+                        modification_time: 200,
+                        data_change: true,
+                        partition_values: HashMap::new(),
+                        stats: None,
+                        tags: None,
+                        deletion_vector: None,
+                    }),
+                    Action::Add(AddAction {
+                        path: "e.parquet".to_string(),
+                        size: huge,
+                        modification_time: 200,
+                        data_change: true,
+                        partition_values: HashMap::new(),
+                        stats: None,
+                        tags: None,
+                        deletion_vector: None,
+                    }),
+                ],
+            },
+            CommitEntry {
+                version: 2,
+                path: "2.json".to_string(),
+                actions: vec![
+                    Action::Add(AddAction {
+                        path: "f.parquet".to_string(),
+                        size: huge,
+                        modification_time: 300,
+                        data_change: true,
+                        partition_values: HashMap::new(),
+                        stats: None,
+                        tags: None,
+                        deletion_vector: None,
+                    }),
+                    Action::Remove(RemoveAction {
+                        path: "a.parquet".to_string(),
+                        deletion_timestamp: Some(300),
+                        data_change: true,
+                        extended_file_metadata: None,
+                        size: None,
+                        partition_values: None,
+                        tags: None,
+                        deletion_vector: None,
+                    }),
+                    Action::Remove(RemoveAction {
+                        path: "b.parquet".to_string(),
+                        deletion_timestamp: Some(300),
+                        data_change: true,
+                        extended_file_metadata: None,
+                        size: None,
+                        partition_values: None,
+                        tags: None,
+                        deletion_vector: None,
+                    }),
+                    Action::Remove(RemoveAction {
+                        path: "c.parquet".to_string(),
+                        deletion_timestamp: Some(300),
+                        data_change: true,
+                        extended_file_metadata: None,
+                        size: None,
+                        partition_values: None,
+                        tags: None,
+                        deletion_vector: None,
+                    }),
+                ],
+            },
+        ];
+
+        let diff = DiffAnalyzer::diff(0, &before, &after);
+        assert_eq!(diff.bytes_added, i64::MAX);
+        assert_eq!(diff.bytes_removed, i64::MAX);
+        assert_eq!(diff.physical_bytes_added, i64::MAX);
+        assert_eq!(diff.physical_bytes_removed, i64::MAX);
     }
 }

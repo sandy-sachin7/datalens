@@ -47,6 +47,19 @@ pub trait StorageBackend: Send + Sync {
     /// List immediate child entries in a directory/subpath (non-recursive).
     fn list(&self, dir_path: &str) -> Result<Vec<String>, DeltaLensError>;
 
+    /// List immediate child entries in a directory/subpath whose filename is
+    /// lexicographically greater than `start_after_name` (non-recursive).
+    /// Cloud object stores implement this via `list_with_offset` to skip
+    /// historical log entries preceding `_last_checkpoint`.
+    /// Returns `Ok(None)` when offset listing is not supported by the backend.
+    fn list_from_offset(
+        &self,
+        _dir_path: &str,
+        _start_after_name: &str,
+    ) -> Result<Option<Vec<String>>, DeltaLensError> {
+        Ok(None)
+    }
+
     /// Read entire file contents as bytes.
     fn read(&self, file_path: &str) -> Result<Vec<u8>, DeltaLensError>;
 
@@ -420,13 +433,22 @@ fn read_directory_names_windows(directory: std::fs::File) -> Result<Vec<OsString
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+fn is_symlink_at(dir_fd: libc::c_int, name: &std::ffi::CStr) -> bool {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstatat(dir_fd, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) };
+    rc == 0 && (stat.st_mode & libc::S_IFMT) == libc::S_IFLNK
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn open_table_directory(root: &Path, path: &str) -> Result<std::fs::File, DeltaLensError> {
     let relative = Path::new(path);
     if relative.is_absolute()
         || relative.components().any(|component| {
             matches!(
                 component,
-                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
             )
         })
     {
@@ -435,19 +457,14 @@ fn open_table_directory(root: &Path, path: &str) -> Result<std::fs::File, DeltaL
         )));
     }
 
+    // Open root once with O_DIRECTORY | O_CLOEXEC to pin it against root-swap TOCTOU,
+    // then walk every relative component with openat(O_NOFOLLOW).
     let root_handle = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
         .open(root)?;
-    let canonical_root = std::fs::canonicalize(root)?;
-    let canonical_target = std::fs::canonicalize(canonical_root.join(relative))?;
-    let target_relative = canonical_target
-        .strip_prefix(&canonical_root)
-        .map_err(|_| {
-            DeltaLensError::Storage(format!("Path escapes table root through a symlink: {path}"))
-        })?;
 
-    open_relative_directory_without_symlinks(root_handle, target_relative)
+    open_relative_directory_without_symlinks(root_handle, relative)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -456,18 +473,32 @@ fn open_relative_directory_without_symlinks(
     relative: &Path,
 ) -> Result<std::fs::File, DeltaLensError> {
     for component in relative.components() {
-        let std::path::Component::Normal(name) = component else {
-            return Err(DeltaLensError::Storage(format!(
-                "Path escapes table root: {}",
-                relative.display()
-            )));
+        let name = match component {
+            std::path::Component::CurDir => continue,
+            std::path::Component::Normal(name) => name,
+            _ => {
+                return Err(DeltaLensError::Storage(format!(
+                    "Path escapes table root: {}",
+                    relative.display()
+                )));
+            }
         };
         let name = std::ffi::CString::new(name.as_bytes())
             .map_err(|_| DeltaLensError::Storage("Path contains a NUL byte".to_string()))?;
         let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY;
         let fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
         if fd < 0 {
-            return Err(std::io::Error::last_os_error().into());
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ELOOP)
+                || (error.raw_os_error() == Some(libc::ENOTDIR)
+                    && is_symlink_at(current.as_raw_fd(), &name))
+            {
+                return Err(DeltaLensError::Storage(format!(
+                    "Path escapes table root through a symlink: {}",
+                    relative.display()
+                )));
+            }
+            return Err(error.into());
         }
         current = unsafe { std::fs::File::from_raw_fd(fd) };
     }
@@ -533,7 +564,9 @@ fn open_table_file(root: &Path, path: &str) -> Result<std::fs::File, DeltaLensEr
         || relative.components().any(|component| {
             matches!(
                 component,
-                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
             )
         })
     {
@@ -542,19 +575,14 @@ fn open_table_file(root: &Path, path: &str) -> Result<std::fs::File, DeltaLensEr
         )));
     }
 
+    // Open root once with O_DIRECTORY | O_CLOEXEC to pin it against root-swap TOCTOU,
+    // then walk every relative component with openat(O_NOFOLLOW).
     let root_handle = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
         .open(root)?;
-    let canonical_root = std::fs::canonicalize(root)?;
-    let canonical_target = std::fs::canonicalize(canonical_root.join(relative))?;
-    let target_relative = canonical_target
-        .strip_prefix(&canonical_root)
-        .map_err(|_| {
-            DeltaLensError::Storage(format!("Path escapes table root through a symlink: {path}"))
-        })?;
 
-    open_relative_without_symlinks(root_handle, target_relative)
+    open_relative_without_symlinks(root_handle, relative)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -562,26 +590,42 @@ fn open_relative_without_symlinks(
     mut current: std::fs::File,
     relative: &Path,
 ) -> Result<std::fs::File, DeltaLensError> {
-    let components: Vec<_> = relative.components().collect();
+    let mut normals = Vec::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::CurDir => continue,
+            std::path::Component::Normal(name) => normals.push(name),
+            _ => {
+                return Err(DeltaLensError::Storage(format!(
+                    "Path escapes table root: {}",
+                    relative.display()
+                )));
+            }
+        }
+    }
 
-    for (index, component) in components.iter().enumerate() {
-        let std::path::Component::Normal(name) = component else {
-            return Err(DeltaLensError::Storage(format!(
-                "Path escapes table root: {}",
-                relative.display()
-            )));
-        };
+    for (index, name) in normals.iter().enumerate() {
         let name = std::ffi::CString::new(name.as_bytes())
             .map_err(|_| DeltaLensError::Storage("Path contains a NUL byte".to_string()))?;
         let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
-        if index + 1 < components.len() {
+        if index + 1 < normals.len() {
             flags |= libc::O_DIRECTORY;
         }
 
         // Each component is opened relative to the prior directory descriptor.
         let fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
         if fd < 0 {
-            return Err(std::io::Error::last_os_error().into());
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ELOOP)
+                || (error.raw_os_error() == Some(libc::ENOTDIR)
+                    && is_symlink_at(current.as_raw_fd(), &name))
+            {
+                return Err(DeltaLensError::Storage(format!(
+                    "Path escapes table root through a symlink: {}",
+                    relative.display()
+                )));
+            }
+            return Err(error.into());
         }
         current = unsafe { std::fs::File::from_raw_fd(fd) };
     }
@@ -739,20 +783,37 @@ impl ObjectStoreBackend {
 
     /// Resolve either a full URI (`scheme://bucket/key`) or a relative subpath (`_delta_log/...`)
     /// into an object store key. Relative paths ALWAYS prepend `self.prefix`.
-    pub fn resolve_key(&self, path: &str) -> String {
+    /// When a full URI matches this backend's scheme & bucket and `self.prefix` is non-empty,
+    /// the key MUST stay beneath `self.prefix` (otherwise `InvalidInput` is returned).
+    pub fn resolve_key(&self, path: &str) -> Result<String, DeltaLensError> {
         if let Some((scheme, rest)) = split_uri_scheme(path) {
             if let Some((authority, key)) = rest.split_once('/') {
-                // A full URI may bypass the configured prefix only when it points
-                // at this backend's own scheme and bucket. Anything else is
-                // treated as a relative key so it cannot reach another bucket.
                 if scheme.eq_ignore_ascii_case(&self.scheme)
                     && authority.eq_ignore_ascii_case(&self.bucket)
                 {
-                    return key.trim_start_matches('/').to_string();
+                    let clean_key = key.trim_start_matches('/');
+                    if clean_key.split('/').any(|seg| seg == "..") {
+                        return Err(DeltaLensError::InvalidInput(format!(
+                            "Object URI '{path}' contains parent path traversal"
+                        )));
+                    }
+                    if !self.prefix.is_empty() {
+                        let within_prefix = clean_key == self.prefix
+                            || clean_key
+                                .strip_prefix(&self.prefix)
+                                .is_some_and(|tail| tail.starts_with('/'));
+                        if !within_prefix {
+                            return Err(DeltaLensError::InvalidInput(format!(
+                                "Object URI '{path}' escapes configured table prefix '{}'",
+                                self.prefix
+                            )));
+                        }
+                    }
+                    return Ok(clean_key.to_string());
                 }
             }
         }
-        self.object_key(path)
+        Ok(self.object_key(path))
     }
 
     fn map_store_error(action: &str, target: &str, err: object_store::Error) -> DeltaLensError {
@@ -782,7 +843,7 @@ impl ObjectStoreBackend {
 #[cfg(feature = "cloud")]
 impl StorageBackend for ObjectStoreBackend {
     fn list(&self, dir_path: &str) -> Result<Vec<String>, DeltaLensError> {
-        let key = self.resolve_key(dir_path);
+        let key = self.resolve_key(dir_path)?;
         let prefix_opt = if key.is_empty() {
             None
         } else {
@@ -804,8 +865,63 @@ impl StorageBackend for ObjectStoreBackend {
             .collect())
     }
 
+    fn list_from_offset(
+        &self,
+        dir_path: &str,
+        start_after_name: &str,
+    ) -> Result<Option<Vec<String>>, DeltaLensError> {
+        let key = self.resolve_key(dir_path)?;
+        let dir_prefix = key.trim_end_matches('/');
+        let prefix_opt = if dir_prefix.is_empty() {
+            None
+        } else {
+            Some(ObjectStorePath::from(format!("{dir_prefix}/")))
+        };
+        let clean_offset = start_after_name.trim_start_matches('/');
+        let offset_key = if dir_prefix.is_empty() {
+            clean_offset.to_string()
+        } else {
+            format!("{dir_prefix}/{clean_offset}")
+        };
+        let offset = ObjectStorePath::from(offset_key);
+
+        let rt = tokio_runtime()?;
+        let metas: Vec<object_store::ObjectMeta> = rt
+            .block_on(async {
+                self.client
+                    .list_with_offset(prefix_opt.as_ref(), &offset)
+                    .try_collect()
+                    .await
+            })
+            .map_err(|e| Self::map_store_error("list", dir_path, e))?;
+
+        let immediate_prefix = if dir_prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{dir_prefix}/")
+        };
+
+        let entries = metas
+            .into_iter()
+            .filter_map(|meta| {
+                let loc = meta.location.as_ref();
+                let rel = if immediate_prefix.is_empty() {
+                    loc
+                } else {
+                    loc.strip_prefix(&immediate_prefix)?
+                };
+                if rel.is_empty() || rel.contains('/') {
+                    return None;
+                }
+                Some(format!("{}://{}/{}", self.scheme, self.bucket, loc))
+            })
+            .collect();
+
+        Ok(Some(entries))
+    }
+
     fn read(&self, file_path: &str) -> Result<Vec<u8>, DeltaLensError> {
-        let key = self.resolve_key(file_path);
+        let key = self.resolve_key(file_path)?;
         let location = ObjectStorePath::from(key);
         let rt = tokio_runtime()?;
         let bytes = rt
@@ -823,8 +939,8 @@ impl StorageBackend for ObjectStoreBackend {
         let concurrency = self.concurrency.max(1);
         let resolved: Vec<(String, ObjectStorePath)> = file_paths
             .iter()
-            .map(|p| (p.clone(), ObjectStorePath::from(self.resolve_key(p))))
-            .collect();
+            .map(|p| Ok((p.clone(), ObjectStorePath::from(self.resolve_key(p)?))))
+            .collect::<Result<Vec<_>, DeltaLensError>>()?;
 
         rt.block_on(async move {
             stream::iter(resolved)
@@ -848,7 +964,7 @@ impl StorageBackend for ObjectStoreBackend {
     }
 
     fn exists(&self, path: &str) -> Result<bool, DeltaLensError> {
-        let key = self.resolve_key(path);
+        let key = self.resolve_key(path)?;
         if key.is_empty() {
             return Ok(true);
         }
@@ -873,7 +989,7 @@ impl StorageBackend for ObjectStoreBackend {
     }
 
     fn is_dir(&self, path: &str) -> Result<bool, DeltaLensError> {
-        let key = self.resolve_key(path);
+        let key = self.resolve_key(path)?;
         let prefix_opt = if key.is_empty() {
             None
         } else {
@@ -1274,7 +1390,7 @@ mod tests {
 
         // Prefix MUST be prepended for relative paths in exists() and read()
         assert_eq!(
-            backend.resolve_key("_delta_log"),
+            backend.resolve_key("_delta_log").unwrap(),
             "warehouse/sales/_delta_log"
         );
         assert!(backend.exists("_delta_log").unwrap());
@@ -1294,9 +1410,26 @@ mod tests {
             .unwrap();
         assert!(rel_bytes.starts_with(b"{\"commitInfo\""));
 
-        // Full URI read() works identically
+        // Full URI read() works identically when beneath prefix
         let full_bytes = backend.read(&listed[0]).unwrap();
         assert_eq!(rel_bytes, full_bytes);
+
+        // Full URI escaping `self.prefix` (including sibling prefix) MUST be rejected!
+        assert!(matches!(
+            backend
+                .resolve_key("s3://my-bucket/warehouse/other/_delta_log/00000000000000000000.json"),
+            Err(DeltaLensError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            backend.resolve_key(
+                "s3://my-bucket/warehouse/sales_other/_delta_log/00000000000000000000.json"
+            ),
+            Err(DeltaLensError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            backend.read("s3://my-bucket/secret/file.json"),
+            Err(DeltaLensError::InvalidInput(_))
+        ));
 
         // Relative nested read (_sidecars) works
         let sidecar = backend

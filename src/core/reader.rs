@@ -119,91 +119,9 @@ impl DeltaLogReader {
         }
 
         let entries = self.storage.list(&self.log_subpath)?;
-        let mut commits = BTreeMap::new();
-        let mut classic_ckpts: BTreeMap<u64, String> = BTreeMap::new();
-        let mut v2_json_ckpts: BTreeMap<u64, String> = BTreeMap::new();
-        let mut v2_parquet_ckpts: BTreeMap<u64, String> = BTreeMap::new();
-        let mut multipart_parts: HashMap<(u64, u32), BTreeMap<u32, String>> = HashMap::new();
-        let mut compactions = Vec::new();
-        let mut has_last_checkpoint = false;
+        let (mut inv, has_last_checkpoint) = parse_inventory_entries(entries);
 
-        for path_str in entries {
-            let Some(name) = basename(&path_str) else {
-                continue;
-            };
-            if name == "_last_checkpoint" {
-                has_last_checkpoint = true;
-                continue;
-            }
-            if let Some(v) = parse_commit_filename(name) {
-                commits.insert(v, path_str);
-                continue;
-            }
-            if let Some((start, end)) = parse_compacted_filename(name) {
-                compactions.push(CompactedFile {
-                    start_version: start,
-                    end_version: end,
-                    path: path_str,
-                });
-                continue;
-            }
-            if let Some(ckpt) = parse_checkpoint_filename(name) {
-                match ckpt {
-                    ParsedCheckpointFile::Classic(v) => {
-                        classic_ckpts.insert(v, path_str);
-                    }
-                    ParsedCheckpointFile::MultiPart {
-                        version,
-                        part,
-                        total,
-                    } => {
-                        multipart_parts
-                            .entry((version, total))
-                            .or_default()
-                            .insert(part, path_str);
-                    }
-                    ParsedCheckpointFile::V2Json(v) => {
-                        v2_json_ckpts.insert(v, path_str);
-                    }
-                    ParsedCheckpointFile::V2Parquet(v) => {
-                        v2_parquet_ckpts.insert(v, path_str);
-                    }
-                }
-            }
-        }
-
-        let mut checkpoints: BTreeMap<u64, CheckpointKind> = BTreeMap::new();
-        for (v, p) in classic_ckpts {
-            checkpoints.insert(v, CheckpointKind::ClassicParquet(p));
-        }
-        for ((version, total), parts_map) in multipart_parts {
-            if total > 0
-                && parts_map.len() == total as usize
-                && (1..=total).all(|i| parts_map.contains_key(&i))
-            {
-                let parts = (1..=total)
-                    .filter_map(|i| parts_map.get(&i).cloned())
-                    .collect();
-                checkpoints.insert(
-                    version,
-                    CheckpointKind::MultiPartParquet {
-                        total_parts: total,
-                        parts,
-                    },
-                );
-            }
-        }
-        // V2 checkpoints take precedence if both exist for the same version.
-        for (v, p) in v2_parquet_ckpts {
-            checkpoints.insert(v, CheckpointKind::V2Parquet(p));
-        }
-        for (v, p) in v2_json_ckpts {
-            checkpoints.insert(v, CheckpointKind::V2Json(p));
-        }
-
-        compactions.sort_by_key(|c| (c.start_version, std::cmp::Reverse(c.end_version)));
-
-        let last_checkpoint_hint = if has_last_checkpoint {
+        inv.last_checkpoint_hint = if has_last_checkpoint {
             self.storage
                 .read(&format!("{}/_last_checkpoint", self.log_subpath))
                 .ok()
@@ -213,14 +131,62 @@ impl DeltaLogReader {
             None
         };
 
-        let inv = LogInventory {
-            commits,
-            checkpoints,
-            compactions,
-            last_checkpoint_hint,
+        Ok(self.inventory_cache.get_or_init(|| inv))
+    }
+
+    /// Attempt an offset-accelerated partial inventory starting from `_last_checkpoint`
+    /// so snapshot reads on large cloud tables avoid listing tens of thousands of old JSON files.
+    /// Returns `Ok(None)` to fall back to a full listing if:
+    /// - full inventory is already cached,
+    /// - `_last_checkpoint` is missing, unreadable, invalid, or points to version 0,
+    /// - `target_version` precedes `_last_checkpoint`,
+    /// - the storage backend does not support offset listing, or
+    /// - `_last_checkpoint` is stale/incomplete (no valid complete checkpoint found).
+    fn try_snapshot_inventory(
+        &self,
+        target_version: Option<u64>,
+    ) -> Result<Option<LogInventory>, DeltaLensError> {
+        if self.inventory_cache.get().is_some() {
+            return Ok(None);
+        }
+
+        let last_ckpt_path = format!("{}/_last_checkpoint", self.log_subpath);
+        let Ok(bytes) = self.storage.read(&last_ckpt_path) else {
+            return Ok(None);
+        };
+        let Ok(last_ckpt) = LastCheckpoint::parse_bytes(&bytes) else {
+            return Ok(None);
+        };
+        let hint_v = last_ckpt.version;
+        if hint_v == 0 {
+            return Ok(None);
+        }
+        if let Some(target) = target_version {
+            if target < hint_v {
+                return Ok(None);
+            }
+        }
+
+        let offset_name = format!("{:020}", hint_v);
+        let Some(entries) = self
+            .storage
+            .list_from_offset(&self.log_subpath, &offset_name)?
+        else {
+            return Ok(None);
         };
 
-        Ok(self.inventory_cache.get_or_init(|| inv))
+        let (mut partial_inv, _) = parse_inventory_entries(entries);
+        partial_inv.last_checkpoint_hint = Some(hint_v);
+
+        let Some(max_v) = partial_inv.max_version() else {
+            return Ok(None);
+        };
+        let check_bound = target_version.map_or(max_v, |t| t.min(max_v));
+        if partial_inv.latest_checkpoint_le(check_bound).is_none() {
+            return Ok(None);
+        }
+
+        Ok(Some(partial_inv))
     }
 
     /// Current (maximum) version in the log across commits, checkpoints, and compactions.
@@ -242,11 +208,23 @@ impl DeltaLogReader {
     /// Read a checkpoint-accelerated snapshot log at `target_version` (default: latest).
     /// Starts from the latest complete checkpoint <= target_version (if one exists) and
     /// replays only subsequent commits (leveraging `.compacted.json` when available).
+    /// On cloud object stores, uses `_last_checkpoint` + `list_with_offset` when valid.
     pub fn read_snapshot_log(
         &self,
         target_version: Option<u64>,
     ) -> Result<SnapshotLog, DeltaLensError> {
+        if let Some(partial_inv) = self.try_snapshot_inventory(target_version)? {
+            return self.read_snapshot_log_from_inventory(&partial_inv, target_version);
+        }
         let inv = self.inventory()?;
+        self.read_snapshot_log_from_inventory(inv, target_version)
+    }
+
+    fn read_snapshot_log_from_inventory(
+        &self,
+        inv: &LogInventory,
+        target_version: Option<u64>,
+    ) -> Result<SnapshotLog, DeltaLensError> {
         let max_v = inv.max_version().ok_or(DeltaLensError::EmptyTable)?;
         let target = match target_version {
             Some(v) => {
@@ -299,6 +277,64 @@ impl DeltaLogReader {
             warnings,
             files_read,
         })
+    }
+
+    /// Read full history starting from version 0 when available, or seeded from the
+    /// earliest available checkpoint when pre-checkpoint commits have expired (so
+    /// `schema --history` retains the pre-pruning schema baseline).
+    pub fn read_history_snapshot_log(&self) -> Result<SnapshotLog, DeltaLensError> {
+        let inv = self.inventory()?;
+        let max_v = inv.max_version().ok_or(DeltaLensError::EmptyTable)?;
+
+        let first_commit_v = inv
+            .commits
+            .keys()
+            .next()
+            .copied()
+            .into_iter()
+            .chain(inv.compactions.iter().map(|c| c.start_version))
+            .min();
+
+        let seed_checkpoint = if first_commit_v == Some(0) {
+            None
+        } else {
+            first_commit_v
+                .and_then(|fv| inv.latest_checkpoint_le(fv))
+                .or_else(|| inv.checkpoints.iter().next().map(|(v, k)| (*v, k)))
+        };
+
+        if let Some((ckpt_v, kind)) = seed_checkpoint {
+            let (checkpoint_actions, mut warnings, mut files_read) = self.read_checkpoint(kind)?;
+            let mut commits = Vec::new();
+            if let Some(start_v) = ckpt_v.checked_add(1) {
+                if start_v <= max_v {
+                    let (delta_commits, delta_warnings, delta_files) =
+                        self.read_contiguous_range(inv, start_v, max_v, true)?;
+                    commits = delta_commits;
+                    warnings.extend(delta_warnings);
+                    files_read += delta_files;
+                }
+            }
+            Ok(SnapshotLog {
+                target_version: max_v,
+                checkpoint_version: Some(ckpt_v),
+                checkpoint_actions,
+                commits,
+                warnings,
+                files_read,
+            })
+        } else {
+            let (commits, warnings) = self.read_all_with_warnings()?;
+            let files_read = commits.len();
+            Ok(SnapshotLog {
+                target_version: max_v,
+                checkpoint_version: None,
+                checkpoint_actions: Vec::new(),
+                commits,
+                warnings,
+                files_read,
+            })
+        }
     }
 
     /// Read commit and compaction files in version range `[from, to]` (inclusive).
@@ -393,7 +429,10 @@ impl DeltaLogReader {
         Ok(entries)
     }
 
-    /// Read only the latest N commit or compaction records with parse warnings.
+    /// Read only the latest N unique commit or compaction records with parse warnings.
+    /// Individual `.json` commits always take precedence over `.compacted.json` files for
+    /// versions they cover; a compaction is included only if it covers at least one version
+    /// that has no individual commit file.
     pub fn read_last_with_warnings(
         &self,
         n: usize,
@@ -402,33 +441,41 @@ impl DeltaLogReader {
             return Ok((Vec::new(), Vec::new()));
         }
         let inv = self.inventory()?;
-        let mut records: Vec<(u64, u64, String)> = inv
+
+        // Individual `.json` commits take precedence over compactions for versions they cover.
+        let mut records: BTreeMap<u64, String> = inv
             .commits
             .iter()
-            .map(|(&version, path)| (version, version, path.clone()))
-            .chain(inv.compactions.iter().map(|compaction| {
-                (
-                    compaction.start_version,
-                    compaction.end_version,
-                    compaction.path.clone(),
-                )
-            }))
+            .map(|(&version, path)| (version, path.clone()))
             .collect();
-        records.sort_unstable_by_key(|&(start, end, _)| (end, start));
+
+        // `inv.compactions` is sorted by `(start_version ASC, end_version DESC)`.
+        // Skip any compaction completely subsumed by an earlier compaction, and only include
+        // compactions that cover at least one version lacking an individual commit file.
+        let mut max_compacted_end: Option<u64> = None;
+        for compaction in &inv.compactions {
+            if max_compacted_end.is_some_and(|max_end| compaction.end_version <= max_end) {
+                continue;
+            }
+            max_compacted_end = Some(compaction.end_version);
+
+            if let Some(uncovered_v) = highest_uncovered_version(
+                &inv.commits,
+                compaction.start_version,
+                compaction.end_version,
+            ) {
+                records
+                    .entry(uncovered_v)
+                    .or_insert_with(|| compaction.path.clone());
+            }
+        }
 
         if records.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
 
-        // Load exactly the selected records. Resolving them as a version range
-        // would let a compaction drop the commits that `read_last(n)` asked for.
-        let mut selected: Vec<(u64, String)> = records
-            .into_iter()
-            .rev()
-            .take(n)
-            .map(|(_, end, path)| (end, path))
-            .collect();
-        selected.sort_unstable_by_key(|&(version, _)| version);
+        let mut selected: Vec<(u64, String)> = records.into_iter().rev().take(n).collect();
+        selected.reverse();
         self.load_and_parse_commits(&selected)
     }
 
@@ -471,8 +518,17 @@ impl DeltaLogReader {
                     None => break,
                 }
             } else {
-                // Report exact gap if a higher version exists, or VersionNotFound if missing.
-                if let Some((&next_found, _)) = inv.commits.range(v..=end_v).next() {
+                // Report exact gap if a higher version exists in commits or compactions,
+                // or VersionNotFound if nothing higher exists in the requested range.
+                let next_commit = inv.commits.range(v..=end_v).next().map(|(&ver, _)| ver);
+                let next_compaction = inv
+                    .compactions
+                    .iter()
+                    .filter(|c| c.start_version > v && c.start_version <= end_v)
+                    .map(|c| c.start_version)
+                    .min();
+                if let Some(next_found) = [next_commit, next_compaction].into_iter().flatten().min()
+                {
                     return Err(DeltaLensError::VersionGap {
                         expected: v,
                         found: next_found,
@@ -596,6 +652,118 @@ impl DeltaLogReader {
 
         Ok((entries, warnings))
     }
+}
+
+fn parse_inventory_entries(entries: Vec<String>) -> (LogInventory, bool) {
+    let mut commits = BTreeMap::new();
+    let mut classic_ckpts: BTreeMap<u64, String> = BTreeMap::new();
+    let mut v2_json_ckpts: BTreeMap<u64, String> = BTreeMap::new();
+    let mut v2_parquet_ckpts: BTreeMap<u64, String> = BTreeMap::new();
+    let mut multipart_parts: HashMap<(u64, u32), BTreeMap<u32, String>> = HashMap::new();
+    let mut compactions = Vec::new();
+    let mut has_last_checkpoint = false;
+
+    for path_str in entries {
+        let Some(name) = basename(&path_str) else {
+            continue;
+        };
+        if name == "_last_checkpoint" {
+            has_last_checkpoint = true;
+            continue;
+        }
+        if let Some(v) = parse_commit_filename(name) {
+            commits.insert(v, path_str);
+            continue;
+        }
+        if let Some((start, end)) = parse_compacted_filename(name) {
+            compactions.push(CompactedFile {
+                start_version: start,
+                end_version: end,
+                path: path_str,
+            });
+            continue;
+        }
+        if let Some(ckpt) = parse_checkpoint_filename(name) {
+            match ckpt {
+                ParsedCheckpointFile::Classic(v) => {
+                    classic_ckpts.insert(v, path_str);
+                }
+                ParsedCheckpointFile::MultiPart {
+                    version,
+                    part,
+                    total,
+                } => {
+                    multipart_parts
+                        .entry((version, total))
+                        .or_default()
+                        .insert(part, path_str);
+                }
+                ParsedCheckpointFile::V2Json(v) => {
+                    v2_json_ckpts.insert(v, path_str);
+                }
+                ParsedCheckpointFile::V2Parquet(v) => {
+                    v2_parquet_ckpts.insert(v, path_str);
+                }
+            }
+        }
+    }
+
+    let mut checkpoints: BTreeMap<u64, CheckpointKind> = BTreeMap::new();
+    for (v, p) in classic_ckpts {
+        checkpoints.insert(v, CheckpointKind::ClassicParquet(p));
+    }
+    for ((version, total), parts_map) in multipart_parts {
+        if total > 0
+            && parts_map.len() == total as usize
+            && (1..=total).all(|i| parts_map.contains_key(&i))
+        {
+            let parts = (1..=total)
+                .filter_map(|i| parts_map.get(&i).cloned())
+                .collect();
+            checkpoints.insert(
+                version,
+                CheckpointKind::MultiPartParquet {
+                    total_parts: total,
+                    parts,
+                },
+            );
+        }
+    }
+    // V2 checkpoints take precedence if both exist for the same version.
+    for (v, p) in v2_parquet_ckpts {
+        checkpoints.insert(v, CheckpointKind::V2Parquet(p));
+    }
+    for (v, p) in v2_json_ckpts {
+        checkpoints.insert(v, CheckpointKind::V2Json(p));
+    }
+
+    compactions.sort_by_key(|c| (c.start_version, std::cmp::Reverse(c.end_version)));
+
+    (
+        LogInventory {
+            commits,
+            checkpoints,
+            compactions,
+            last_checkpoint_hint: None,
+        },
+        has_last_checkpoint,
+    )
+}
+
+/// Return the highest version in `[start, end]` that does not have an individual commit file,
+/// or `None` if every version in `[start, end]` is already covered by `commits`.
+fn highest_uncovered_version(commits: &BTreeMap<u64, String>, start: u64, end: u64) -> Option<u64> {
+    let mut candidate = end;
+    for (&v, _) in commits.range(start..=end).rev() {
+        if v < candidate {
+            return Some(candidate);
+        }
+        if candidate == start {
+            return None;
+        }
+        candidate = candidate.checked_sub(1)?;
+    }
+    Some(candidate)
 }
 
 fn sidecar_storage_path(log_subpath: &str, sidecar_path: &str) -> Result<String, DeltaLensError> {
@@ -1168,5 +1336,252 @@ mod tests {
         assert_eq!(entries[0].version, 8);
         assert_eq!(entries[1].version, 9);
         assert_eq!(entries[2].version, 10);
+    }
+
+    #[test]
+    fn test_read_last_deduplicates_overlapping_compaction_when_commits_exist() {
+        let tmp = TempDir::new().unwrap();
+        let log_dir = tmp.path().join("_delta_log");
+        std::fs::create_dir(&log_dir).unwrap();
+
+        let action = r#"{"commitInfo":{"timestamp":1700000000000,"operation":"WRITE","operationParameters":{}}}"#;
+        for v in 0..=10 {
+            make_commit(&log_dir, v, action);
+        }
+        // Coexisting overlapping compaction covering 0..=9 must NOT duplicate version 9!
+        std::fs::write(
+            log_dir.join("00000000000000000000.00000000000000000009.compacted.json"),
+            r#"{"add":{"path":"compacted.parquet","size":123,"modificationTime":1700000000000,"dataChange":true,"partitionValues":{}}}"#,
+        )
+        .unwrap();
+
+        let reader = create_reader(&tmp);
+        let entries = reader.read_last(3).unwrap();
+        let versions: Vec<u64> = entries.iter().map(|e| e.version).collect();
+        assert_eq!(versions, vec![8, 9, 10]);
+        assert!(entries[1].path.ends_with("00000000000000000009.json"));
+    }
+
+    #[test]
+    fn test_contiguous_range_detects_gap_before_compaction() {
+        let tmp = TempDir::new().unwrap();
+        let log_dir = tmp.path().join("_delta_log");
+        std::fs::create_dir(&log_dir).unwrap();
+
+        make_commit(
+            &log_dir,
+            0,
+            r#"{"commitInfo":{"timestamp":1700000000000,"operation":"WRITE"}}"#,
+        );
+        // Commit 1 is missing, compaction covers 2..=3.
+        std::fs::write(
+            log_dir.join("00000000000000000002.00000000000000000003.compacted.json"),
+            r#"{"add":{"path":"c.parquet","size":123,"modificationTime":1700000000000,"dataChange":true,"partitionValues":{}}}"#,
+        )
+        .unwrap();
+
+        let reader = create_reader(&tmp);
+        assert!(matches!(
+            reader.read_range(Some(0), Some(3)),
+            Err(DeltaLensError::VersionGap {
+                expected: 1,
+                found: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn test_read_history_snapshot_log_seeds_earliest_checkpoint_when_commits_pruned() {
+        use crate::core::analyzer::schema::SchemaTracker;
+
+        let tmp = TempDir::new().unwrap();
+        let log_dir = tmp.path().join("_delta_log");
+        std::fs::create_dir(&log_dir).unwrap();
+
+        // Commits 0..=9 were pruned; V2 JSON checkpoint at v10 holds baseline schema `[id: long]`.
+        let ckpt_v10 = concat!(
+            r#"{"checkpointMetadata":{"version":2}}"#,
+            "\n",
+            r#"{"metaData":{"id":"t","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1700000000000}}"#,
+            "\n"
+        );
+        std::fs::write(
+            log_dir.join("00000000000000000010.checkpoint.uuid-10.json"),
+            ckpt_v10,
+        )
+        .unwrap();
+
+        // Commit v11 adds column `email`.
+        make_commit(
+            &log_dir,
+            11,
+            concat!(
+                r#"{"metaData":{"id":"t","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}},{\"name\":\"email\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1700000000000}}"#,
+                "\n",
+                r#"{"commitInfo":{"timestamp":1700000005000,"operation":"WRITE"}}"#
+            ),
+        );
+
+        let reader = create_reader(&tmp);
+        let snap_log = reader.read_history_snapshot_log().unwrap();
+        assert_eq!(snap_log.checkpoint_version, Some(10));
+        assert_eq!(snap_log.target_version, 11);
+
+        let history = SchemaTracker::history_from_snapshot(&snap_log);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].version, 11);
+        assert_eq!(history[0].added_columns, vec!["email".to_string()]);
+    }
+
+    #[cfg(feature = "cloud")]
+    #[test]
+    fn test_last_checkpoint_accelerated_cloud_listing_and_fallbacks() {
+        use crate::core::storage::ObjectStoreBackend;
+        use bytes::Bytes;
+        use object_store::memory::InMemory;
+        use object_store::path::Path as ObjectStorePath;
+        use object_store::ObjectStore;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingStorage {
+            inner: ObjectStoreBackend,
+            full_list_calls: Arc<AtomicUsize>,
+            offset_list_calls: Arc<AtomicUsize>,
+        }
+
+        impl StorageBackend for CountingStorage {
+            fn list(&self, dir_path: &str) -> Result<Vec<String>, DeltaLensError> {
+                self.full_list_calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.list(dir_path)
+            }
+
+            fn list_from_offset(
+                &self,
+                dir_path: &str,
+                start_after_name: &str,
+            ) -> Result<Option<Vec<String>>, DeltaLensError> {
+                self.offset_list_calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.list_from_offset(dir_path, start_after_name)
+            }
+
+            fn read(&self, file_path: &str) -> Result<Vec<u8>, DeltaLensError> {
+                self.inner.read(file_path)
+            }
+
+            fn read_many(
+                &self,
+                file_paths: &[String],
+            ) -> Result<Vec<(String, Vec<u8>)>, DeltaLensError> {
+                self.inner.read_many(file_paths)
+            }
+
+            fn exists(&self, path: &str) -> Result<bool, DeltaLensError> {
+                self.inner.exists(path)
+            }
+
+            fn is_dir(&self, path: &str) -> Result<bool, DeltaLensError> {
+                self.inner.is_dir(path)
+            }
+
+            fn root_display(&self) -> &str {
+                self.inner.root_display()
+            }
+        }
+
+        let mem = Arc::new(InMemory::new());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            for v in 0..=19u64 {
+                let key = format!("warehouse/t/_delta_log/{:020}.json", v);
+                let payload = format!(
+                    r#"{{"add":{{"path":"f-{v}.parquet","size":100,"modificationTime":1700000000000,"dataChange":true,"partitionValues":{{}}}}}}"#
+                );
+                mem.put(&ObjectStorePath::from(key), Bytes::from(payload).into())
+                    .await
+                    .unwrap();
+            }
+            // V2 JSON checkpoint at v15 + _last_checkpoint pointing to v15
+            let ckpt = concat!(
+                r#"{"checkpointMetadata":{"version":2}}"#,
+                "\n",
+                r#"{"add":{"path":"ckpt-15.parquet","size":500,"modificationTime":1700000000000,"dataChange":false,"partitionValues":{}}}"#,
+                "\n"
+            );
+            mem.put(
+                &ObjectStorePath::from(
+                    "warehouse/t/_delta_log/00000000000000000015.checkpoint.abcd.json",
+                ),
+                Bytes::from_static(ckpt.as_bytes()).into(),
+            )
+            .await
+            .unwrap();
+            // Nested sidecar file must be ignored by non-recursive list_from_offset
+            mem.put(
+                &ObjectStorePath::from("warehouse/t/_delta_log/_sidecars/ignored.parquet"),
+                Bytes::from_static(b"unused").into(),
+            )
+            .await
+            .unwrap();
+            mem.put(
+                &ObjectStorePath::from("warehouse/t/_delta_log/_last_checkpoint"),
+                Bytes::from_static(br#"{"version":15,"size":2}"#).into(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let make_reader = |store: Arc<InMemory>| {
+            let full_calls = Arc::new(AtomicUsize::new(0));
+            let offset_calls = Arc::new(AtomicUsize::new(0));
+            let backend = ObjectStoreBackend::from_object_store(
+                store,
+                "s3",
+                "bucket",
+                "warehouse/t",
+                "s3://bucket/warehouse/t".to_string(),
+            );
+            let counting = CountingStorage {
+                inner: backend,
+                full_list_calls: Arc::clone(&full_calls),
+                offset_list_calls: Arc::clone(&offset_calls),
+            };
+            let reader =
+                DeltaLogReader::new(Box::new(counting), "s3://bucket/warehouse/t").unwrap();
+            (reader, full_calls, offset_calls)
+        };
+
+        // 1. Latest snapshot uses list_from_offset and NEVER calls full list()!
+        let (reader, full_calls, offset_calls) = make_reader(Arc::clone(&mem));
+        let snap = reader.read_snapshot_log(None).unwrap();
+        assert_eq!(snap.target_version, 19);
+        assert_eq!(snap.checkpoint_version, Some(15));
+        assert_eq!(snap.commits.len(), 4); // 16, 17, 18, 19
+        assert_eq!(offset_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(full_calls.load(Ordering::SeqCst), 0);
+
+        // 2. Historical version < hint (v10 < 15) falls back to full list()!
+        let (reader_hist, full_calls_hist, offset_calls_hist) = make_reader(Arc::clone(&mem));
+        let hist_snap = reader_hist.read_snapshot_log(Some(10)).unwrap();
+        assert_eq!(hist_snap.target_version, 10);
+        assert_eq!(hist_snap.checkpoint_version, None);
+        assert_eq!(hist_snap.commits.len(), 11); // 0..=10
+        assert_eq!(offset_calls_hist.load(Ordering::SeqCst), 0);
+        assert_eq!(full_calls_hist.load(Ordering::SeqCst), 1);
+
+        // 3. Stale _last_checkpoint (points to non-existent v99) falls back to full list()!
+        rt.block_on(async {
+            mem.put(
+                &ObjectStorePath::from("warehouse/t/_delta_log/_last_checkpoint"),
+                Bytes::from_static(br#"{"version":99,"size":2}"#).into(),
+            )
+            .await
+            .unwrap();
+        });
+        let (reader_stale, full_calls_stale, offset_calls_stale) = make_reader(Arc::clone(&mem));
+        let stale_snap = reader_stale.read_snapshot_log(None).unwrap();
+        assert_eq!(stale_snap.target_version, 19);
+        assert_eq!(stale_snap.checkpoint_version, Some(15));
+        assert_eq!(offset_calls_stale.load(Ordering::SeqCst), 1);
+        assert_eq!(full_calls_stale.load(Ordering::SeqCst), 1);
     }
 }

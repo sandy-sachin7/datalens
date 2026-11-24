@@ -2,7 +2,9 @@ use crate::core::model::action::{
     Action, AddAction, DomainMetadataAction, MetaDataAction, ProtocolAction, RemoveAction,
     TxnAction,
 };
-use crate::core::model::stats::TombstoneInfo;
+use crate::core::model::stats::{
+    parse_delta_interval_ms, TombstoneInfo, DEFAULT_DELETED_FILE_RETENTION_MS,
+};
 use crate::core::reader::{CommitEntry, SnapshotLog};
 use std::collections::{HashMap, HashSet};
 
@@ -203,11 +205,11 @@ impl TableState {
                     }
 
                     let bytes = resolved_size.unwrap_or(0);
-                    delta.physical_files_removed += 1;
+                    delta.physical_files_removed = delta.physical_files_removed.saturating_add(1);
                     delta.physical_bytes_removed =
                         delta.physical_bytes_removed.saturating_add(bytes);
                     if r.data_change {
-                        delta.logical_files_removed += 1;
+                        delta.logical_files_removed = delta.logical_files_removed.saturating_add(1);
                         delta.logical_bytes_removed =
                             delta.logical_bytes_removed.saturating_add(bytes);
                     }
@@ -246,11 +248,11 @@ impl TableState {
                 self.active_tombstones.remove(&key);
                 self.active_files.insert(key, a.clone());
 
-                delta.physical_files_added += 1;
-                delta.physical_bytes_added += a.size;
+                delta.physical_files_added = delta.physical_files_added.saturating_add(1);
+                delta.physical_bytes_added = delta.physical_bytes_added.saturating_add(a.size);
                 if a.data_change {
-                    delta.logical_files_added += 1;
-                    delta.logical_bytes_added += a.size;
+                    delta.logical_files_added = delta.logical_files_added.saturating_add(1);
+                    delta.logical_bytes_added = delta.logical_bytes_added.saturating_add(a.size);
                 }
             }
         }
@@ -302,19 +304,72 @@ impl TableState {
             .collect()
     }
 
-    /// Summarize retained soft-deleted file tombstones.
+    /// Parse `delta.deletedFileRetentionDuration` from table metadata, defaulting to 7 days.
+    pub fn deleted_file_retention_ms(&self) -> i64 {
+        self.metadata
+            .as_ref()
+            .and_then(|m| {
+                m.configuration
+                    .get("delta.deletedFileRetentionDuration")
+                    .or_else(|| {
+                        m.configuration
+                            .iter()
+                            .find(|(k, _)| {
+                                k.eq_ignore_ascii_case("delta.deletedFileRetentionDuration")
+                            })
+                            .map(|(_, v)| v)
+                    })
+                    .and_then(|v| v.as_deref())
+                    .and_then(parse_delta_interval_ms)
+            })
+            .unwrap_or(DEFAULT_DELETED_FILE_RETENTION_MS)
+    }
+
+    /// Summarize retained soft-deleted file tombstones using default retention without expiration check.
     pub fn tombstone_info(&self) -> TombstoneInfo {
+        self.tombstone_info_with_retention(self.deleted_file_retention_ms(), None)
+    }
+
+    /// Summarize retained soft-deleted file tombstones against the given retention window
+    /// and optional reference timestamp (epoch ms).
+    pub fn tombstone_info_with_retention(
+        &self,
+        retention_duration_ms: i64,
+        reference_ts: Option<i64>,
+    ) -> TombstoneInfo {
         let active_tombstones = self.active_tombstones.len();
-        let reclaimable_bytes: i64 = self.active_tombstones.values().filter_map(|r| r.size).sum();
+        let reclaimable_bytes: i64 = self
+            .active_tombstones
+            .values()
+            .filter_map(|r| r.size)
+            .fold(0i64, i64::saturating_add);
         let oldest_tombstone_timestamp = self
             .active_tombstones
             .values()
             .filter_map(|r| r.deletion_timestamp)
             .min();
+
+        let mut expired_tombstones = 0usize;
+        let mut expired_reclaimable_bytes = 0i64;
+        if let Some(ref_ts) = reference_ts {
+            for r in self.active_tombstones.values() {
+                if let Some(del_ts) = r.deletion_timestamp {
+                    if del_ts > 0 && ref_ts.saturating_sub(del_ts) > retention_duration_ms {
+                        expired_tombstones += 1;
+                        expired_reclaimable_bytes =
+                            expired_reclaimable_bytes.saturating_add(r.size.unwrap_or(0));
+                    }
+                }
+            }
+        }
+
         TombstoneInfo {
             active_tombstones,
             reclaimable_bytes,
             oldest_tombstone_timestamp,
+            expired_tombstones,
+            expired_reclaimable_bytes,
+            retention_duration_ms,
         }
     }
 }
@@ -439,5 +494,40 @@ mod tests {
         };
         state.apply_commit(&c0);
         assert_eq!(state.clustering_columns(), vec!["user_id", "event.ts"]);
+    }
+
+    #[test]
+    fn test_saturating_arithmetic_on_huge_file_sizes() {
+        let huge = i64::MAX / 2;
+        let mut state = TableState::default();
+        let c0 = CommitEntry {
+            version: 0,
+            path: "0.json".to_string(),
+            actions: vec![
+                make_add("a.parquet", huge, None),
+                make_add("b.parquet", huge, None),
+                make_add("c.parquet", huge, None),
+            ],
+        };
+        let add_delta = state.apply_commit(&c0);
+        assert_eq!(add_delta.logical_bytes_added, i64::MAX);
+        assert_eq!(add_delta.physical_bytes_added, i64::MAX);
+
+        let c1 = CommitEntry {
+            version: 1,
+            path: "1.json".to_string(),
+            actions: vec![
+                make_remove("a.parquet", None),
+                make_remove("b.parquet", None),
+                make_remove("c.parquet", None),
+            ],
+        };
+        let rem_delta = state.apply_commit(&c1);
+        assert_eq!(rem_delta.logical_bytes_removed, i64::MAX);
+        assert_eq!(rem_delta.physical_bytes_removed, i64::MAX);
+
+        let tombs = state.tombstone_info();
+        assert_eq!(tombs.active_tombstones, 3);
+        assert_eq!(tombs.reclaimable_bytes, i64::MAX);
     }
 }

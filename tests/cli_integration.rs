@@ -424,6 +424,72 @@ fn test_parquet_checkpoint_table_cli_end_to_end() {
     let sch_json: serde_json::Value = serde_json::from_slice(&sch.get_output().stdout).unwrap();
     assert_eq!(sch_json["version"], 10);
     assert_eq!(sch_json["schema"]["fields"][0]["name"], "k");
+
+    // Commit v12 evolves the schema by adding `extra` — `schema --history` must seed from
+    // checkpoint v10 (since commits 0..=9 were pruned) and detect the v12 addition!
+    write_commit(
+        &log_dir,
+        12,
+        &[
+            r#"{"metaData":{"id":"ckpt-tbl","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"k\",\"type\":\"string\",\"nullable\":false,\"metadata\":{}},{\"name\":\"extra\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1700000000000}}"#,
+            r#"{"commitInfo":{"timestamp":1700000010000,"operation":"WRITE"}}"#,
+        ],
+    );
+    let hist = deltalens_cmd()
+        .args(["schema", path, "--history", "--json"])
+        .assert()
+        .success();
+    let hist_json: serde_json::Value = serde_json::from_slice(&hist.get_output().stdout).unwrap();
+    let hist_arr = hist_json.as_array().unwrap();
+    assert_eq!(hist_arr.len(), 1);
+    assert_eq!(hist_arr[0]["version"], 12);
+    assert_eq!(hist_arr[0]["added_columns"], serde_json::json!(["extra"]));
+}
+
+#[test]
+fn test_cli_version_is_2_0_0_and_checkpoint_horizon_passes_fail_on_issues() {
+    deltalens_cmd()
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2.0.0"));
+
+    // High-version table (>100) with checkpoint at v150, commit v151, no post-checkpoint VACUUM,
+    // and no expired tombstones must pass `inspect --fail-on-issues` (exit 0) and display
+    // "Not observed since checkpoint v150" instead of "Never".
+    let tmp = TempDir::new().unwrap();
+    let log_dir = tmp.path().join("_delta_log");
+    fs::create_dir(&log_dir).unwrap();
+
+    let ckpt_v150 = concat!(
+        r#"{"checkpointMetadata":{"version":2}}"#,
+        "\n",
+        r#"{"metaData":{"id":"hi-ver","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1700000000000}}"#,
+        "\n",
+        r#"{"add":{"path":"big1.parquet","size":67108864,"modificationTime":1750000000000,"dataChange":false,"partitionValues":{}}}"#,
+        "\n",
+        r#"{"add":{"path":"big2.parquet","size":67108864,"modificationTime":1750000000000,"dataChange":false,"partitionValues":{}}}"#,
+        "\n"
+    );
+    fs::write(
+        log_dir.join("00000000000000000150.checkpoint.uuid-150.json"),
+        ckpt_v150,
+    )
+    .unwrap();
+    write_commit(
+        &log_dir,
+        151,
+        &[r#"{"commitInfo":{"timestamp":1750000005000,"operation":"WRITE"}}"#],
+    );
+
+    let path = tmp.path().to_str().unwrap();
+    let out = deltalens_cmd()
+        .args(["inspect", path, "--plain", "--fail-on-issues"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("Not observed since checkpoint v150"));
+    assert!(!stdout.contains("Never"));
 }
 
 #[test]

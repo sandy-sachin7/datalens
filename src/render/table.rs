@@ -68,10 +68,23 @@ pub struct TableRenderer {
     use_color: bool,
 }
 
+/// Strict `no-color.org` check: only disable color when `NO_COLOR` is set AND non-empty.
+fn should_use_color(
+    plain: bool,
+    no_color_env: Option<&std::ffi::OsStr>,
+    is_terminal: bool,
+) -> bool {
+    let no_color = no_color_env.is_some_and(|v| !v.is_empty());
+    !plain && !no_color && is_terminal
+}
+
 impl TableRenderer {
     pub fn new(plain: bool, no_header: bool) -> Self {
-        let use_color =
-            !plain && std::env::var_os("NO_COLOR").is_none() && io::stdout().is_terminal();
+        let use_color = should_use_color(
+            plain,
+            std::env::var_os("NO_COLOR").as_deref(),
+            io::stdout().is_terminal(),
+        );
         Self {
             plain,
             no_header,
@@ -311,7 +324,10 @@ impl TableRenderer {
                 ),
                 _ => format!("v{:03}", v),
             },
-            None => "Never".to_string(),
+            None => match stats.maintenance.last_checkpoint_version {
+                Some(ckpt_v) => format!("Not observed since checkpoint v{:03}", ckpt_v),
+                None => "Never".to_string(),
+            },
         };
         table.add_row(vec!["Last VACUUM".to_string(), last_vac]);
 
@@ -324,7 +340,10 @@ impl TableRenderer {
                 ),
                 _ => format!("v{:03}", v),
             },
-            None => "Never".to_string(),
+            None => match stats.maintenance.last_checkpoint_version {
+                Some(ckpt_v) => format!("Not observed since checkpoint v{:03}", ckpt_v),
+                None => "Never".to_string(),
+            },
         };
         table.add_row(vec!["Last OPTIMIZE".to_string(), last_opt]);
 
@@ -516,7 +535,7 @@ impl TableRenderer {
             ]);
             table.add_row(vec![
                 "Net File Delta".to_string(),
-                format!("{:+}", diff.files_added - diff.files_removed),
+                format!("{:+}", diff.files_added.saturating_sub(diff.files_removed)),
             ]);
             table.add_row(vec![
                 "Size Added".to_string(),
@@ -528,7 +547,7 @@ impl TableRenderer {
             ]);
             table.add_row(vec![
                 "Net Size Delta".to_string(),
-                format_signed_bytes(diff.bytes_added - diff.bytes_removed),
+                format_signed_bytes(diff.bytes_added.saturating_sub(diff.bytes_removed)),
             ]);
 
             if diff.physical_files_added != diff.files_added
@@ -541,7 +560,8 @@ impl TableRenderer {
                         diff.physical_files_added,
                         diff.physical_files_removed,
                         format_signed_bytes(
-                            diff.physical_bytes_added - diff.physical_bytes_removed
+                            diff.physical_bytes_added
+                                .saturating_sub(diff.physical_bytes_removed)
                         )
                     ),
                 ]);
@@ -630,8 +650,10 @@ impl TableRenderer {
             let writer_pad = format!("{:<24}", entry.writer);
 
             // Show physical bytes when logical delta is 0 but physical rewrite occurred (e.g. OPTIMIZE).
-            let logical_net = entry.bytes_added - entry.bytes_removed;
-            let phys_net = entry.physical_bytes_added - entry.physical_bytes_removed;
+            let logical_net = entry.bytes_added.saturating_sub(entry.bytes_removed);
+            let phys_net = entry
+                .physical_bytes_added
+                .saturating_sub(entry.physical_bytes_removed);
             let (display_net, is_phys_only) = if entry.num_files_added == 0
                 && entry.num_files_removed == 0
                 && (entry.physical_files_added > 0 || entry.physical_files_removed > 0)
@@ -719,7 +741,7 @@ impl TableRenderer {
             };
             let pred_pad = format!("{:<35}", predicate_raw);
 
-            let net_bytes = entry.bytes_added - entry.bytes_removed;
+            let net_bytes = entry.bytes_added.saturating_sub(entry.bytes_removed);
             let (impact_raw, impact_sign) = match entry.num_output_rows {
                 Some(r) => (format_rows(r), r),
                 None => (format_signed_bytes(net_bytes), net_bytes),
@@ -937,6 +959,9 @@ mod tests {
                 active_tombstones: 2,
                 reclaimable_bytes: 2048,
                 oldest_tombstone_timestamp: Some(1_700_000_000_000),
+                expired_tombstones: 0,
+                expired_reclaimable_bytes: 0,
+                retention_duration_ms: crate::core::model::stats::DEFAULT_DELETED_FILE_RETENTION_MS,
             },
             maintenance: MaintenanceInfo {
                 last_vacuum_version: Some(120),
@@ -1047,5 +1072,99 @@ mod tests {
         assert!(!s2.contains("Schema at v003"));
         assert!(!s2.contains("Field Name"));
         assert!(s2.contains("long"));
+    }
+
+    #[test]
+    fn test_no_color_follows_spec_empty_vs_non_empty() {
+        use std::ffi::OsStr;
+
+        // Per no-color.org, empty NO_COLOR="" MUST NOT disable color!
+        assert!(should_use_color(false, None, true));
+        assert!(should_use_color(false, Some(OsStr::new("")), true));
+        // Non-empty NO_COLOR="1" disables color
+        assert!(!should_use_color(false, Some(OsStr::new("1")), true));
+        // Plain mode or non-TTY always disables color
+        assert!(!should_use_color(true, Some(OsStr::new("")), true));
+        assert!(!should_use_color(false, Some(OsStr::new("")), false));
+    }
+
+    #[test]
+    fn test_checkpoint_horizon_renders_not_observed_instead_of_never() {
+        let mut stats = sample_stats();
+        stats.maintenance.last_vacuum_version = None;
+        stats.maintenance.last_vacuum_timestamp = None;
+        stats.maintenance.last_optimize_version = None;
+        stats.maintenance.last_optimize_timestamp = None;
+        stats.maintenance.last_checkpoint_version = Some(140);
+
+        let renderer = TableRenderer::with_options(true, false, false);
+        let mut buf = Vec::new();
+        renderer
+            .render_inspect_to(&mut buf, "./tbl", &stats)
+            .unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("Not observed since checkpoint v140"));
+        assert!(!out.contains("Never"));
+    }
+
+    #[test]
+    fn test_renderer_saturating_sub_on_extreme_deltas() {
+        let diff = VersionDiff {
+            v1: 0,
+            v2: 1,
+            schema_changes: vec![],
+            has_breaking_schema_changes: false,
+            files_added: i64::MAX,
+            files_removed: i64::MIN,
+            bytes_added: i64::MAX,
+            bytes_removed: i64::MIN,
+            physical_files_added: i64::MAX,
+            physical_files_removed: -1,
+            physical_bytes_added: i64::MAX,
+            physical_bytes_removed: i64::MIN,
+            new_partitions: vec![],
+            removed_partitions: vec![],
+            operations: std::collections::HashMap::new(),
+            total_commits: 1,
+        };
+        let renderer = TableRenderer::with_options(true, false, false);
+        let mut buf = Vec::new();
+        renderer
+            .render_diff_to(&mut buf, "./tbl", &diff, false, false)
+            .unwrap();
+        assert!(!buf.is_empty());
+
+        let entry = LineageEntry {
+            version: 1,
+            timestamp: Some(1_700_000_000_000),
+            operation: OperationType::Write,
+            operation_raw: "WRITE".to_string(),
+            writer: "spark".to_string(),
+            num_files_added: 1,
+            num_files_removed: 1,
+            bytes_added: i64::MAX,
+            bytes_removed: i64::MIN,
+            physical_files_added: 1,
+            physical_files_removed: 1,
+            physical_bytes_added: i64::MIN,
+            physical_bytes_removed: i64::MAX,
+            num_output_rows: None,
+            predicate: None,
+            user_name: None,
+            cluster_id: None,
+            engine_info: None,
+            has_commit_info: true,
+        };
+        let mut lin_buf = Vec::new();
+        renderer
+            .render_lineage_to(&mut lin_buf, "./tbl", std::slice::from_ref(&entry))
+            .unwrap();
+        assert!(!lin_buf.is_empty());
+
+        let mut aud_buf = Vec::new();
+        renderer
+            .render_audit_to(&mut aud_buf, "./tbl", std::slice::from_ref(&entry))
+            .unwrap();
+        assert!(!aud_buf.is_empty());
     }
 }
