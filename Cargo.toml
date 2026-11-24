@@ -59,7 +59,7 @@ colored = "2"
 chrono = { version = "0.4", features = ["serde"] }
 
 # Error handling
-thiserror = "1"
+thiserror = "2"
 
 # Human readable sizes
 bytesize = "1"
