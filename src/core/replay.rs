@@ -204,10 +204,12 @@ impl TableState {
 
                     let bytes = resolved_size.unwrap_or(0);
                     delta.physical_files_removed += 1;
-                    delta.physical_bytes_removed += bytes;
+                    delta.physical_bytes_removed =
+                        delta.physical_bytes_removed.saturating_add(bytes);
                     if r.data_change {
                         delta.logical_files_removed += 1;
-                        delta.logical_bytes_removed += bytes;
+                        delta.logical_bytes_removed =
+                            delta.logical_bytes_removed.saturating_add(bytes);
                     }
 
                     let mut enriched = r.clone();

@@ -92,7 +92,9 @@ impl HealthAnalyzer {
     fn compute_health(state: &TableState) -> TableHealth {
         let sizes: Vec<i64> = state.active_files.values().map(|a| a.size).collect();
         let total_files = sizes.len();
-        let total_size: i64 = sizes.iter().sum();
+        let total_size: i64 = sizes
+            .iter()
+            .fold(0i64, |acc, &size| acc.saturating_add(size));
         let avg_size = if total_files > 0 {
             total_size / total_files as i64
         } else {

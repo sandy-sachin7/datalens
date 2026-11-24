@@ -1,6 +1,21 @@
 use crate::error::DeltaLensError;
 use rayon::prelude::*;
+use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+#[cfg(windows)]
+use std::os::windows::ffi::OsStringExt;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 
 #[cfg(feature = "cloud")]
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -74,28 +89,77 @@ impl LocalStorage {
         }
     }
 
-    fn resolve_path(&self, path: &str) -> PathBuf {
-        if path.is_empty() {
-            return self.root.clone();
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn resolve_path(&self, path: &str) -> Result<PathBuf, DeltaLensError> {
+        let relative = Path::new(path);
+        if relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(DeltaLensError::Storage(format!(
+                "Path escapes table root: {path}"
+            )));
         }
-        let p = Path::new(path);
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            self.root.join(p)
+
+        let canonical_root = match std::fs::canonicalize(&self.root) {
+            Ok(root) => root,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(self.root.join(relative));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let candidate = canonical_root.join(relative);
+
+        // Check every existing prefix. This rejects symlinks that resolve outside
+        // the table while still allowing paths whose final file does not exist.
+        let mut probe = candidate.as_path();
+        loop {
+            if let Ok(metadata) = std::fs::symlink_metadata(probe) {
+                if metadata.file_type().is_symlink() {
+                    let resolved = std::fs::canonicalize(probe)?;
+                    if !resolved.starts_with(&canonical_root) {
+                        return Err(DeltaLensError::Storage(format!(
+                            "Path escapes table root through a symlink: {path}"
+                        )));
+                    }
+                }
+            }
+
+            if probe == canonical_root {
+                break;
+            }
+            probe = probe.parent().ok_or_else(|| {
+                DeltaLensError::Storage(format!("Path escapes table root: {path}"))
+            })?;
         }
+
+        Ok(candidate)
     }
 }
 
 impl StorageBackend for LocalStorage {
     fn list(&self, dir_path: &str) -> Result<Vec<String>, DeltaLensError> {
-        let full_path = self.resolve_path(dir_path);
         let prefix = dir_path.trim_matches('/');
 
-        let mut entries = Vec::new();
-        for entry in std::fs::read_dir(&full_path)? {
-            let entry = entry?;
-            let file_name = entry.file_name().to_string_lossy().to_string();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let names = read_directory_names(open_table_directory(&self.root, dir_path)?)?;
+
+        #[cfg(windows)]
+        let names =
+            read_directory_names_windows(open_table_directory_windows(&self.root, dir_path)?)?;
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        let names = std::fs::read_dir(self.resolve_path(dir_path)?)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut entries = Vec::with_capacity(names.len());
+        for name in names {
+            let file_name = name.to_string_lossy().to_string();
             // Always return paths relative to `self.root` so subsequent `read()`
             // never double-joins relative roots (e.g., `rel/dir` + `rel/dir/_delta_log/...`).
             let rel = if prefix.is_empty() {
@@ -109,8 +173,18 @@ impl StorageBackend for LocalStorage {
     }
 
     fn read(&self, file_path: &str) -> Result<Vec<u8>, DeltaLensError> {
-        let path = self.resolve_path(file_path);
-        Ok(std::fs::read(&path)?)
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let mut file = open_table_file(&self.root, file_path)?;
+
+        #[cfg(windows)]
+        let mut file = open_table_file_windows(&self.root, file_path)?;
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        let mut file = std::fs::File::open(self.resolve_path(file_path)?)?;
+
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)?;
+        Ok(contents)
     }
 
     fn read_many(&self, file_paths: &[String]) -> Result<Vec<(String, Vec<u8>)>, DeltaLensError> {
@@ -124,16 +198,395 @@ impl StorageBackend for LocalStorage {
     }
 
     fn exists(&self, path: &str) -> Result<bool, DeltaLensError> {
-        Ok(self.resolve_path(path).exists())
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            // Use the same no-follow open as `read` so a symlink swapped in
+            // after path validation cannot make us report an outside entry.
+            match open_table_file(&self.root, path) {
+                Ok(_) => Ok(true),
+                Err(DeltaLensError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(false)
+                }
+                Err(e) => Err(e),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Ok(self.resolve_path(path)?.exists())
+        }
     }
 
     fn is_dir(&self, path: &str) -> Result<bool, DeltaLensError> {
-        Ok(self.resolve_path(path).is_dir())
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            match open_table_directory(&self.root, path) {
+                Ok(_) => Ok(true),
+                Err(DeltaLensError::Io(ref e))
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        || e.raw_os_error() == Some(libc::ENOTDIR) =>
+                {
+                    Ok(false)
+                }
+                Err(e) => Err(e),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Ok(self.resolve_path(path)?.is_dir())
+        }
     }
 
     fn root_display(&self) -> &str {
         &self.root_display
     }
+}
+
+#[cfg(windows)]
+fn open_table_file_windows(root: &Path, path: &str) -> Result<std::fs::File, DeltaLensError> {
+    let relative = Path::new(path);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(DeltaLensError::Storage(format!(
+            "Path escapes table root: {path}"
+        )));
+    }
+
+    let root_handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS)
+        .open(root)?;
+    let file = std::fs::File::open(root.join(relative))?;
+    ensure_windows_handle_within_root(&root_handle, &file, path)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn ensure_windows_handle_within_root(
+    root_handle: &std::fs::File,
+    file_handle: &std::fs::File,
+    original_path: &str,
+) -> Result<(), DeltaLensError> {
+    let root_path = windows_final_path(root_handle)?;
+    let file_path = windows_final_path(file_handle)?;
+    if !file_path.starts_with(&root_path) {
+        return Err(DeltaLensError::Storage(format!(
+            "Path escapes table root through a reparse point: {original_path}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_final_path(file: &std::fs::File) -> Result<PathBuf, DeltaLensError> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_DOS,
+    };
+
+    let flags = FILE_NAME_NORMALIZED | VOLUME_NAME_DOS;
+    let mut buffer = vec![0u16; 512];
+    loop {
+        // The open handle pins the object while Windows resolves its final path.
+        let length = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle() as _,
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                flags,
+            )
+        };
+        if length == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if (length as usize) < buffer.len() {
+            buffer.truncate(length as usize);
+            return Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer)));
+        }
+        buffer.resize(length as usize + 1, 0);
+    }
+}
+
+#[cfg(windows)]
+fn open_table_directory_windows(root: &Path, path: &str) -> Result<std::fs::File, DeltaLensError> {
+    let relative = Path::new(path);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(DeltaLensError::Storage(format!(
+            "Path escapes table root: {path}"
+        )));
+    }
+
+    let root_handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS)
+        .open(root)?;
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS)
+        .open(root.join(relative))?;
+    ensure_windows_handle_within_root(&root_handle, &directory, path)?;
+    Ok(directory)
+}
+
+#[cfg(windows)]
+fn read_directory_names_windows(directory: std::fs::File) -> Result<Vec<OsString>, DeltaLensError> {
+    use windows_sys::Win32::Foundation::ERROR_NO_MORE_FILES;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, GetFileInformationByHandleEx,
+        FILE_ID_BOTH_DIR_INFO,
+    };
+
+    let mut names = Vec::new();
+    let mut buffer = vec![0u64; 8192];
+    let buffer_bytes = std::mem::size_of_val(buffer.as_slice());
+    let mut restart = true;
+
+    loop {
+        let info_class = if restart {
+            FileIdBothDirectoryRestartInfo
+        } else {
+            FileIdBothDirectoryInfo
+        };
+        restart = false;
+
+        let succeeded = unsafe {
+            GetFileInformationByHandleEx(
+                directory.as_raw_handle() as _,
+                info_class,
+                buffer.as_mut_ptr().cast(),
+                buffer_bytes as u32,
+            )
+        };
+        if succeeded == 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                break;
+            }
+            return Err(error.into());
+        }
+
+        let buffer_ptr = buffer.as_ptr().cast::<u8>();
+        let mut offset = 0usize;
+        loop {
+            if offset + std::mem::size_of::<FILE_ID_BOTH_DIR_INFO>() > buffer_bytes {
+                return Err(DeltaLensError::Storage(
+                    "Invalid directory entry returned by Windows".to_string(),
+                ));
+            }
+            let info = unsafe { &*buffer_ptr.add(offset).cast::<FILE_ID_BOTH_DIR_INFO>() };
+            if info.FileNameLength % 2 != 0 {
+                return Err(DeltaLensError::Storage(
+                    "Invalid directory name returned by Windows".to_string(),
+                ));
+            }
+            let name_len = (info.FileNameLength / 2) as usize;
+            let name_ptr = std::ptr::addr_of!(info.FileName).cast::<u16>();
+            let name_offset = name_ptr as usize - buffer_ptr as usize;
+            if name_len * 2 > buffer_bytes.saturating_sub(name_offset) {
+                return Err(DeltaLensError::Storage(
+                    "Invalid directory entry returned by Windows".to_string(),
+                ));
+            }
+            let name = unsafe { std::slice::from_raw_parts(name_ptr, name_len) };
+            if name != [b'.' as u16] && name != [b'.' as u16, b'.' as u16] {
+                names.push(OsString::from_wide(name));
+            }
+
+            let next_offset = info.NextEntryOffset as usize;
+            if next_offset == 0 {
+                break;
+            }
+            if next_offset > buffer_bytes - offset {
+                return Err(DeltaLensError::Storage(
+                    "Invalid directory entry offset returned by Windows".to_string(),
+                ));
+            }
+            offset += next_offset;
+        }
+    }
+
+    Ok(names)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_table_directory(root: &Path, path: &str) -> Result<std::fs::File, DeltaLensError> {
+    let relative = Path::new(path);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(DeltaLensError::Storage(format!(
+            "Path escapes table root: {path}"
+        )));
+    }
+
+    let root_handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(root)?;
+    let canonical_root = std::fs::canonicalize(root)?;
+    let canonical_target = std::fs::canonicalize(canonical_root.join(relative))?;
+    let target_relative = canonical_target
+        .strip_prefix(&canonical_root)
+        .map_err(|_| {
+            DeltaLensError::Storage(format!("Path escapes table root through a symlink: {path}"))
+        })?;
+
+    open_relative_directory_without_symlinks(root_handle, target_relative)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_relative_directory_without_symlinks(
+    mut current: std::fs::File,
+    relative: &Path,
+) -> Result<std::fs::File, DeltaLensError> {
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(DeltaLensError::Storage(format!(
+                "Path escapes table root: {}",
+                relative.display()
+            )));
+        };
+        let name = std::ffi::CString::new(name.as_bytes())
+            .map_err(|_| DeltaLensError::Storage("Path contains a NUL byte".to_string()))?;
+        let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY;
+        let fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        current = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+
+    Ok(current)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_directory_names(directory: std::fs::File) -> Result<Vec<OsString>, DeltaLensError> {
+    let fd = directory.into_raw_fd();
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(error.into());
+    }
+
+    let mut names = Vec::new();
+    let read_result = loop {
+        clear_errno();
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error().unwrap_or(0) != 0 {
+                break Err(DeltaLensError::Io(error));
+            }
+            break Ok(());
+        }
+
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(OsString::from_vec(name.to_bytes().to_vec()));
+        }
+    };
+    let close_result = unsafe { libc::closedir(stream) };
+    read_result?;
+    if close_result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(names)
+}
+
+#[cfg(target_os = "linux")]
+fn clear_errno() {
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn clear_errno() {
+    unsafe {
+        *libc::__error() = 0;
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_table_file(root: &Path, path: &str) -> Result<std::fs::File, DeltaLensError> {
+    let relative = Path::new(path);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(DeltaLensError::Storage(format!(
+            "Path escapes table root: {path}"
+        )));
+    }
+
+    let root_handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(root)?;
+    let canonical_root = std::fs::canonicalize(root)?;
+    let canonical_target = std::fs::canonicalize(canonical_root.join(relative))?;
+    let target_relative = canonical_target
+        .strip_prefix(&canonical_root)
+        .map_err(|_| {
+            DeltaLensError::Storage(format!("Path escapes table root through a symlink: {path}"))
+        })?;
+
+    open_relative_without_symlinks(root_handle, target_relative)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_relative_without_symlinks(
+    mut current: std::fs::File,
+    relative: &Path,
+) -> Result<std::fs::File, DeltaLensError> {
+    let components: Vec<_> = relative.components().collect();
+
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(DeltaLensError::Storage(format!(
+                "Path escapes table root: {}",
+                relative.display()
+            )));
+        };
+        let name = std::ffi::CString::new(name.as_bytes())
+            .map_err(|_| DeltaLensError::Storage("Path contains a NUL byte".to_string()))?;
+        let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        if index + 1 < components.len() {
+            flags |= libc::O_DIRECTORY;
+        }
+
+        // Each component is opened relative to the prior directory descriptor.
+        let fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        current = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+
+    Ok(current)
 }
 
 // ---------------------------------------------------------------------------
@@ -287,11 +740,17 @@ impl ObjectStoreBackend {
     /// Resolve either a full URI (`scheme://bucket/key`) or a relative subpath (`_delta_log/...`)
     /// into an object store key. Relative paths ALWAYS prepend `self.prefix`.
     pub fn resolve_key(&self, path: &str) -> String {
-        if let Some((_scheme, rest)) = split_uri_scheme(path) {
-            if let Some((_authority, key)) = rest.split_once('/') {
-                return key.trim_start_matches('/').to_string();
+        if let Some((scheme, rest)) = split_uri_scheme(path) {
+            if let Some((authority, key)) = rest.split_once('/') {
+                // A full URI may bypass the configured prefix only when it points
+                // at this backend's own scheme and bucket. Anything else is
+                // treated as a relative key so it cannot reach another bucket.
+                if scheme.eq_ignore_ascii_case(&self.scheme)
+                    && authority.eq_ignore_ascii_case(&self.bucket)
+                {
+                    return key.trim_start_matches('/').to_string();
+                }
             }
-            return String::new();
         }
         self.object_key(path)
     }
@@ -612,6 +1071,164 @@ mod tests {
         let storage = LocalStorage::new(tmp.path().to_string_lossy().to_string());
         assert!(storage.exists("_delta_log").unwrap());
         assert!(!storage.is_dir("_delta_log").unwrap());
+    }
+
+    #[test]
+    fn test_local_storage_rejects_parent_path() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("table");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(tmp.path().join("outside.json"), b"secret").unwrap();
+
+        let storage = LocalStorage::new(root.to_string_lossy().to_string());
+        assert!(matches!(
+            storage.read("../outside.json"),
+            Err(DeltaLensError::Storage(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_local_storage_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("table");
+        let sidecars = root.join("_delta_log/_sidecars");
+        std::fs::create_dir_all(&sidecars).unwrap();
+        let outside = tmp.path().join("outside.parquet");
+        std::fs::write(&outside, b"outside table").unwrap();
+        symlink(&outside, sidecars.join("outside.parquet")).unwrap();
+
+        let storage = LocalStorage::new(root.to_string_lossy().to_string());
+        assert!(matches!(
+            storage.read("_delta_log/_sidecars/outside.parquet"),
+            Err(DeltaLensError::Storage(_))
+        ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_exists_and_is_dir_reject_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("table");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, root.join("link")).unwrap();
+
+        let storage = LocalStorage::new(root.to_string_lossy().to_string());
+        assert!(matches!(
+            storage.exists("link"),
+            Err(DeltaLensError::Storage(_))
+        ));
+        assert!(matches!(
+            storage.is_dir("link"),
+            Err(DeltaLensError::Storage(_))
+        ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_descriptor_relative_read_rejects_symlink_swap() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("table");
+        let safe_dir = root.join("data");
+        let outside_dir = tmp.path().join("outside");
+        std::fs::create_dir_all(&safe_dir).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::fs::write(safe_dir.join("file.parquet"), b"inside").unwrap();
+        std::fs::write(outside_dir.join("file.parquet"), b"outside").unwrap();
+
+        let root_handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(&root)
+            .unwrap();
+        let resolved_target = Path::new("data/file.parquet");
+
+        std::fs::rename(&safe_dir, root.join("data-original")).unwrap();
+        symlink(&outside_dir, &safe_dir).unwrap();
+
+        assert!(open_relative_without_symlinks(root_handle, resolved_target).is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_descriptor_relative_list_uses_pinned_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("table");
+        let log_dir = root.join("_delta_log");
+        let replacement_dir = tmp.path().join("replacement");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::create_dir(&replacement_dir).unwrap();
+        std::fs::write(log_dir.join("inside.json"), b"inside").unwrap();
+        std::fs::write(replacement_dir.join("outside.json"), b"outside").unwrap();
+
+        let directory = open_table_directory(&root, "_delta_log").unwrap();
+        std::fs::rename(&log_dir, root.join("_delta_log-old")).unwrap();
+        symlink(&replacement_dir, &log_dir).unwrap();
+
+        let names = read_directory_names(directory).unwrap();
+        assert!(names.iter().any(|name| name == "inside.json"));
+        assert!(!names.iter().any(|name| name == "outside.json"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_handle_path_check_rejects_external_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("table");
+        std::fs::create_dir(&root).unwrap();
+        let inside = root.join("inside.json");
+        let outside = tmp.path().join("outside.json");
+        std::fs::write(&inside, b"inside").unwrap();
+        std::fs::write(&outside, b"outside").unwrap();
+
+        let storage = LocalStorage::new(root.to_string_lossy().to_string());
+        assert_eq!(storage.read("inside.json").unwrap(), b"inside");
+
+        let root_handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&root)
+            .unwrap();
+        let outside_handle = std::fs::File::open(outside).unwrap();
+        assert!(matches!(
+            ensure_windows_handle_within_root(&root_handle, &outside_handle, "outside.json"),
+            Err(DeltaLensError::Storage(message))
+                if message.contains("Path escapes table root")
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_directory_listing_uses_pinned_handle() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("table");
+        let log_dir = root.join("_delta_log");
+        let replacement_dir = tmp.path().join("replacement");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::create_dir(&replacement_dir).unwrap();
+        std::fs::write(log_dir.join("inside.json"), b"inside").unwrap();
+        std::fs::write(replacement_dir.join("outside.json"), b"outside").unwrap();
+
+        let directory = open_table_directory_windows(&root, "_delta_log").unwrap();
+        std::fs::rename(&log_dir, root.join("_delta_log-old")).unwrap();
+        std::fs::rename(&replacement_dir, &log_dir).unwrap();
+
+        let names = read_directory_names_windows(directory).unwrap();
+        assert!(names.iter().any(|name| name == "inside.json"));
+        assert!(!names.iter().any(|name| name == "outside.json"));
     }
 
     #[test]

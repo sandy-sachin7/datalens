@@ -28,6 +28,8 @@ pub enum CheckpointKind {
 }
 
 /// A Delta log compaction file covering `[start_version, end_version]`.
+/// Its actions are returned as one entry at `end_version` because the file does not
+/// preserve per-commit attribution.
 #[derive(Debug, Clone)]
 pub struct CompactedFile {
     pub start_version: u64,
@@ -299,7 +301,7 @@ impl DeltaLogReader {
         })
     }
 
-    /// Read all JSON commit files in version range `[from, to]` (inclusive).
+    /// Read commit and compaction files in version range `[from, to]` (inclusive).
     pub fn read_range(
         &self,
         from: Option<u64>,
@@ -309,66 +311,89 @@ impl DeltaLogReader {
         Ok(entries)
     }
 
-    /// Read JSON commit files in `[from, to]` (inclusive), returning structured parse warnings.
+    /// Read commit and compaction files in `[from, to]` with parse warnings.
     pub fn read_range_with_warnings(
         &self,
         from: Option<u64>,
         to: Option<u64>,
     ) -> Result<(Vec<CommitEntry>, Vec<ParseWarning>), DeltaLensError> {
-        let inv = self.inventory()?;
-        let selected: Vec<(u64, String)> = inv
-            .commits
-            .iter()
-            .filter(|(&v, _)| {
-                from.map(|f| v >= f).unwrap_or(true) && to.map(|t| v <= t).unwrap_or(true)
-            })
-            .map(|(&v, p)| (v, p.clone()))
-            .collect();
-
-        if selected.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
-        }
-
-        // Validate contiguity across selected commits when a specific subrange is requested.
-        for window in selected.windows(2) {
-            let prev = window[0].0;
-            let curr = window[1].0;
-            if curr != prev + 1 {
-                let covered_by_compaction = inv
-                    .compactions
-                    .iter()
-                    .any(|c| c.start_version <= prev + 1 && c.end_version >= curr - 1);
-                if !covered_by_compaction {
-                    return Err(DeltaLensError::VersionGap {
-                        expected: prev + 1,
-                        found: curr,
-                    });
-                }
+        if let (Some(start), Some(end)) = (from, to) {
+            if start > end {
+                return Err(DeltaLensError::InvalidVersionRange(start, end));
             }
         }
 
-        self.load_and_parse_commits(&selected)
+        let inv = self.inventory()?;
+        let first_available = inv
+            .commits
+            .keys()
+            .next()
+            .copied()
+            .into_iter()
+            .chain(inv.compactions.iter().map(|c| c.start_version))
+            .min();
+        let last_available = inv
+            .commits
+            .keys()
+            .next_back()
+            .copied()
+            .into_iter()
+            .chain(inv.compactions.iter().map(|c| c.end_version))
+            .max();
+
+        let (Some(first_available), Some(last_available)) = (first_available, last_available)
+        else {
+            return if let Some(requested) = from.or(to) {
+                Err(DeltaLensError::VersionNotFound(requested))
+            } else {
+                Ok((Vec::new(), Vec::new()))
+            };
+        };
+
+        let start = from.unwrap_or(first_available);
+        let end = to.unwrap_or(last_available);
+        if from.is_some() && start > last_available {
+            return Err(DeltaLensError::VersionNotFound(start));
+        }
+        if to.is_some() && end > last_available {
+            return Err(DeltaLensError::VersionNotFound(end));
+        }
+        if from.is_none() && to.is_some() && end < first_available {
+            return Err(DeltaLensError::VersionNotFound(end));
+        }
+        if start > end {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        if start < first_available {
+            return Err(DeltaLensError::VersionGap {
+                expected: start,
+                found: first_available,
+            });
+        }
+
+        let (entries, warnings, _) = self.read_contiguous_range(inv, start, end, true)?;
+        Ok((entries, warnings))
     }
 
-    /// Read all available JSON commits.
+    /// Read all available commits and compaction files.
     pub fn read_all(&self) -> Result<Vec<CommitEntry>, DeltaLensError> {
         self.read_range(None, None)
     }
 
-    /// Read all available JSON commits along with structured parse warnings.
+    /// Read all available commits and compaction files with structured warnings.
     pub fn read_all_with_warnings(
         &self,
     ) -> Result<(Vec<CommitEntry>, Vec<ParseWarning>), DeltaLensError> {
         self.read_range_with_warnings(None, None)
     }
 
-    /// Read only the latest N commits.
+    /// Read only the latest N commit or compaction records.
     pub fn read_last(&self, n: usize) -> Result<Vec<CommitEntry>, DeltaLensError> {
         let (entries, _warnings) = self.read_last_with_warnings(n)?;
         Ok(entries)
     }
 
-    /// Read only the latest N commits along with structured parse warnings.
+    /// Read only the latest N commit or compaction records with parse warnings.
     pub fn read_last_with_warnings(
         &self,
         n: usize,
@@ -377,14 +402,33 @@ impl DeltaLogReader {
             return Ok((Vec::new(), Vec::new()));
         }
         let inv = self.inventory()?;
-        let mut selected: Vec<(u64, String)> = inv
+        let mut records: Vec<(u64, u64, String)> = inv
             .commits
             .iter()
+            .map(|(&version, path)| (version, version, path.clone()))
+            .chain(inv.compactions.iter().map(|compaction| {
+                (
+                    compaction.start_version,
+                    compaction.end_version,
+                    compaction.path.clone(),
+                )
+            }))
+            .collect();
+        records.sort_unstable_by_key(|&(start, end, _)| (end, start));
+
+        if records.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        // Load exactly the selected records. Resolving them as a version range
+        // would let a compaction drop the commits that `read_last(n)` asked for.
+        let mut selected: Vec<(u64, String)> = records
+            .into_iter()
             .rev()
             .take(n)
-            .map(|(&v, p)| (v, p.clone()))
+            .map(|(_, end, path)| (end, path))
             .collect();
-        selected.reverse();
+        selected.sort_unstable_by_key(|&(version, _)| version);
         self.load_and_parse_commits(&selected)
     }
 
@@ -407,6 +451,8 @@ impl DeltaLogReader {
                     .filter(|c| c.start_version == v && c.end_version <= end_v)
                     .max_by_key(|c| c.end_version)
                 {
+                    // A compacted file has no per-commit version attribution. Keep its
+                    // actions together and label the entry with the covered end version.
                     planned.push((comp.end_version, comp.path.clone()));
                     match comp.end_version.checked_add(1) {
                         Some(next) => {
@@ -478,17 +524,15 @@ impl DeltaLogReader {
             }
         }
 
-        // Resolve V2 checkpoint sidecar files (`_delta_log/_sidecars/<path>`).
+        // Resolve V2 checkpoint sidecar files below `_delta_log/_sidecars/`.
         let sidecar_paths: Vec<String> = actions
             .iter()
-            .filter_map(|a| match a {
-                Action::Sidecar(sc) => {
-                    let clean = sc.path.trim_start_matches('/');
-                    Some(format!("{}/_sidecars/{}", self.log_subpath, clean))
-                }
+            .filter_map(|action| match action {
+                Action::Sidecar(sidecar) => Some(sidecar.path.as_str()),
                 _ => None,
             })
-            .collect();
+            .map(|path| sidecar_storage_path(&self.log_subpath, path))
+            .collect::<Result<Vec<_>, _>>()?;
 
         if !sidecar_paths.is_empty() {
             let sidecar_blobs = self.storage.read_many(&sidecar_paths)?;
@@ -552,6 +596,26 @@ impl DeltaLogReader {
 
         Ok((entries, warnings))
     }
+}
+
+fn sidecar_storage_path(log_subpath: &str, sidecar_path: &str) -> Result<String, DeltaLensError> {
+    let relative = std::path::Path::new(sidecar_path);
+    if sidecar_path.is_empty()
+        || sidecar_path.contains('\\')
+        || sidecar_path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(DeltaLensError::Checkpoint(format!(
+            "Invalid V2 checkpoint sidecar path: {sidecar_path}"
+        )));
+    }
+
+    Ok(format!("{log_subpath}/_sidecars/{sidecar_path}"))
 }
 
 enum ParsedCheckpointFile {
@@ -976,6 +1040,95 @@ mod tests {
     }
 
     #[test]
+    fn test_range_requires_every_requested_version() {
+        let tmp = TempDir::new().unwrap();
+        let log_dir = tmp.path().join("_delta_log");
+        std::fs::create_dir(&log_dir).unwrap();
+        let action = r#"{"commitInfo":{"timestamp":1700000000000,"operation":"WRITE"}}"#;
+        make_commit(&log_dir, 1, action);
+        make_commit(&log_dir, 2, action);
+
+        let reader = create_reader(&tmp);
+        assert!(matches!(
+            reader.read_range(Some(0), Some(2)),
+            Err(DeltaLensError::VersionGap {
+                expected: 0,
+                found: 1
+            })
+        ));
+        assert!(matches!(
+            reader.read_range(Some(1), Some(3)),
+            Err(DeltaLensError::VersionNotFound(3))
+        ));
+
+        let later_history = TempDir::new().unwrap();
+        let later_log = later_history.path().join("_delta_log");
+        std::fs::create_dir(&later_log).unwrap();
+        make_commit(&later_log, 5, action);
+        make_commit(&later_log, 6, action);
+        let later_reader = create_reader(&later_history);
+        assert!(matches!(
+            later_reader.read_range(None, Some(4)),
+            Err(DeltaLensError::VersionNotFound(4))
+        ));
+    }
+
+    #[test]
+    fn test_range_reads_compaction_files_instead_of_omitting_them() {
+        let tmp = TempDir::new().unwrap();
+        let log_dir = tmp.path().join("_delta_log");
+        std::fs::create_dir(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("00000000000000000000.00000000000000000001.compacted.json"),
+            r#"{"add":{"path":"from-compaction.parquet","size":123,"modificationTime":1700000000000,"dataChange":true,"partitionValues":{}}}"#,
+        )
+        .unwrap();
+        make_commit(
+            &log_dir,
+            2,
+            r#"{"add":{"path":"from-v2.parquet","size":456,"modificationTime":1700000001000,"dataChange":true,"partitionValues":{}}}"#,
+        );
+
+        let reader = create_reader(&tmp);
+        let entries = reader.read_range(Some(0), Some(2)).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].version, 1);
+        assert!(entries[0].actions.iter().any(
+            |action| matches!(action, Action::Add(add) if add.path == "from-compaction.parquet")
+        ));
+        assert_eq!(entries[1].version, 2);
+
+        let latest = reader.read_last(2).unwrap();
+        assert_eq!(latest.len(), 2);
+        assert_eq!(latest[0].version, 1);
+        assert_eq!(latest[1].version, 2);
+    }
+
+    #[test]
+    fn test_sidecar_path_traversal_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let log_dir = tmp.path().join("_delta_log");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("00000000000000000000.checkpoint.1234.json"),
+            concat!(
+                r#"{"checkpointMetadata":{"version":0}}"#,
+                "\n",
+                r#"{"sidecar":{"path":"../../outside.parquet","sizeInBytes":1,"modificationTime":0}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let reader = create_reader(&tmp);
+        assert!(matches!(
+            reader.read_snapshot_log(Some(0)),
+            Err(DeltaLensError::Checkpoint(message))
+                if message.contains("Invalid V2 checkpoint sidecar path")
+        ));
+    }
+
+    #[test]
     fn test_read_last() {
         let tmp = TempDir::new().unwrap();
         let log_dir = tmp.path().join("_delta_log");
@@ -991,5 +1144,29 @@ mod tests {
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].version, 7);
         assert_eq!(entries[2].version, 9);
+    }
+
+    #[test]
+    fn test_read_last_keeps_commits_covered_by_a_compaction() {
+        let tmp = TempDir::new().unwrap();
+        let log_dir = tmp.path().join("_delta_log");
+        std::fs::create_dir(&log_dir).unwrap();
+
+        let action = r#"{"commitInfo":{"timestamp":1700000000000,"operation":"WRITE","operationParameters":{}}}"#;
+        for v in 0..10 {
+            make_commit(&log_dir, v, action);
+        }
+        std::fs::write(
+            log_dir.join("00000000000000000000.00000000000000000010.compacted.json"),
+            r#"{"add":{"path":"compacted.parquet","size":123,"modificationTime":1700000000000,"dataChange":true,"partitionValues":{}}}"#,
+        )
+        .unwrap();
+
+        let reader = create_reader(&tmp);
+        let entries = reader.read_last(3).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].version, 8);
+        assert_eq!(entries[1].version, 9);
+        assert_eq!(entries[2].version, 10);
     }
 }
