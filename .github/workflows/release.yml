@@ -13,8 +13,30 @@ env:
   BINARY_NAME: deltalens
 
 jobs:
+  verify:
+    name: Verify · fmt, clippy & test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: cargo fmt check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --locked
+
   build:
     name: Build · ${{ matrix.target }}
+    needs: verify
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -86,15 +108,18 @@ jobs:
         run: |
           BINARY="target/${{ matrix.target }}/release/${BINARY_NAME}"
           STAGING="${BINARY_NAME}-${{ github.ref_name }}-${{ matrix.asset_suffix }}"
-          STAGING="${STAGING%.tar.gz}"   # strip extension for dir name
+          STAGING="${STAGING%.tar.gz}"
           mkdir -p "${STAGING}"
           cp "${BINARY}" "${STAGING}/"
           cp README.md LICENSE "${STAGING}/"
           tar czf "${STAGING}.tar.gz" "${STAGING}"
           echo "ASSET=${STAGING}.tar.gz" >> $GITHUB_ENV
 
-          # SHA256 checksum
-          sha256sum "${STAGING}.tar.gz" > "${STAGING}.tar.gz.sha256"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${STAGING}.tar.gz" > "${STAGING}.tar.gz.sha256"
+          else
+            shasum -a 256 "${STAGING}.tar.gz" > "${STAGING}.tar.gz.sha256"
+          fi
           echo "ASSET_SHA=${STAGING}.tar.gz.sha256" >> $GITHUB_ENV
 
       - name: Package (Windows)
@@ -110,7 +135,6 @@ jobs:
           Compress-Archive -Path "$staging\*" -DestinationPath "$staging.zip"
           echo "ASSET=$staging.zip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-          # SHA256 checksum
           $hash = (Get-FileHash "$staging.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  $staging.zip" | Out-File -Encoding utf8 "$staging.zip.sha256"
           echo "ASSET_SHA=$staging.zip.sha256" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
@@ -122,10 +146,10 @@ jobs:
             ${{ env.ASSET }}
             ${{ env.ASSET_SHA }}
 
-  # ── Publish crate to crates.io after all builds succeed ──────────────────
+  # ── Publish crate to crates.io after verification & all builds succeed ────
   publish:
     name: Publish to crates.io
-    needs: build
+    needs: [verify, build]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -133,6 +157,9 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Test package before publishing
+        run: cargo test --locked
 
       - name: Publish
         env:

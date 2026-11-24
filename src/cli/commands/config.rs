@@ -1,59 +1,93 @@
+use crate::cli::output_opts::{CommandOutcome, OutputOpts};
 use crate::core::config::DeltalensConfig;
 use crate::core::metrics::MetricsRecorder;
 use crate::error::DeltaLensError;
+use crate::render::json::render_json;
 
-pub fn show() -> Result<(), DeltaLensError> {
+pub fn show(opts: OutputOpts) -> Result<CommandOutcome, DeltaLensError> {
     let config = DeltalensConfig::load();
-    println!("Config file: {}", DeltalensConfig::path().display());
-    println!(
-        "Telemetry: {}",
-        if config.telemetry {
-            "enabled"
-        } else {
-            "disabled"
-        }
-    );
-    Ok(())
+    let cfg_path = DeltalensConfig::path();
+    if opts.json {
+        render_json(&serde_json::json!({
+            "path": cfg_path.display().to_string(),
+            "telemetry": config.telemetry,
+        }))?;
+    } else {
+        println!("Config file: {}", cfg_path.display());
+        println!(
+            "Telemetry: {}",
+            if config.telemetry {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+    }
+    Ok(CommandOutcome::default())
 }
 
-pub fn path() -> Result<(), DeltaLensError> {
-    println!("{}", DeltalensConfig::path().display());
-    Ok(())
+pub fn path(opts: OutputOpts) -> Result<CommandOutcome, DeltaLensError> {
+    let cfg_path = DeltalensConfig::path();
+    if opts.json {
+        render_json(&serde_json::json!({
+            "path": cfg_path.display().to_string(),
+        }))?;
+    } else {
+        println!("{}", cfg_path.display());
+    }
+    Ok(CommandOutcome::default())
 }
 
-pub fn set(key: &str, value: &str) -> Result<(), DeltaLensError> {
+pub fn set(key: &str, value: &str, opts: OutputOpts) -> Result<CommandOutcome, DeltaLensError> {
     let mut config = DeltalensConfig::load();
     match key {
-        "telemetry" => match value {
+        "telemetry" => match value.to_ascii_lowercase().as_str() {
             "true" | "yes" | "1" => config.telemetry = true,
             "false" | "no" | "0" => config.telemetry = false,
             _ => {
-                eprintln!(
-                    "Invalid value '{}' for '{}'. Use true or false.",
-                    value, key
-                );
-                return Ok(());
+                return Err(DeltaLensError::InvalidInput(format!(
+                    "Invalid value '{value}' for '{key}'. Expected true or false."
+                )));
             }
         },
         _ => {
-            eprintln!("Unknown config key '{}'. Available keys: telemetry", key);
+            return Err(DeltaLensError::InvalidInput(format!(
+                "Unknown config key '{key}'. Available keys: telemetry"
+            )));
         }
     }
+
     config
         .save()
         .map_err(|e| DeltaLensError::Storage(e.to_string()))?;
-    println!("Set {} = {}", key, value);
-    Ok(())
+
+    if opts.json {
+        render_json(&serde_json::json!({
+            "key": key,
+            "value": config.telemetry,
+            "path": DeltalensConfig::path().display().to_string(),
+        }))?;
+    } else {
+        println!("Set {} = {}", key, config.telemetry);
+    }
+    Ok(CommandOutcome::default())
 }
 
-pub fn metrics() -> Result<(), DeltaLensError> {
+pub fn metrics(opts: OutputOpts) -> Result<CommandOutcome, DeltaLensError> {
     let summary = MetricsRecorder::summary();
-    println!("=== Metrics Summary ===");
+    if opts.json {
+        render_json(&summary)?;
+        return Ok(CommandOutcome::default());
+    }
+
+    if !opts.no_header {
+        println!("=== Metrics Summary ===");
+    }
     println!("Total commands:     {}", summary.total_commands);
     if summary.total_commands == 0 {
         println!("No metrics recorded yet. Enable telemetry with:");
         println!("  deltalens config set telemetry true");
-        return Ok(());
+        return Ok(CommandOutcome::default());
     }
     println!("Total duration:     {:.1} ms", summary.total_duration_ms);
     println!("Average duration:   {:.1} ms", summary.avg_duration_ms);
@@ -61,11 +95,15 @@ pub fn metrics() -> Result<(), DeltaLensError> {
     println!("P95 latency:        {:.1} ms", summary.p95_ms);
     println!("P99 latency:        {:.1} ms", summary.p99_ms);
     println!();
-    println!("=== By Command ===");
+    if !opts.no_header {
+        println!("=== By Command ===");
+    }
     let mut pairs: Vec<_> = summary.command_counts.iter().collect();
-    pairs.sort_by_key(|(_, &c)| std::cmp::Reverse(c));
+    pairs.sort_by(|(a_cmd, &a_cnt), (b_cmd, &b_cnt)| {
+        b_cnt.cmp(&a_cnt).then_with(|| a_cmd.cmp(b_cmd))
+    });
     for (cmd, count) in &pairs {
         println!("  {:<12} {}", cmd, count);
     }
-    Ok(())
+    Ok(CommandOutcome::default())
 }

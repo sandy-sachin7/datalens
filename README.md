@@ -1,20 +1,19 @@
 # DeltaLens
 
-**Inspect, diff, trace, and audit Delta Lake tables from your terminal — no Spark, no JVM, no Python.**
+**Standalone CLI to inspect, diff, trace, and audit Delta Lake tables from your terminal — no Spark, no JVM, no Python.**
 
-```
-deltalens inspect ./transactions              # table health report
-deltalens diff s3://my-bucket/transactions --v1 10 --v2 20  # diff on S3
-deltalens lineage ./transactions --last 10    # who wrote what and when
+```bash
+deltalens inspect ./transactions                           # table health, checkpoints, tombstones & skew
+deltalens diff s3://my-bucket/transactions --v1 10 --v2 20 # schema & file diff on S3
+deltalens lineage ./transactions --last 10 --op WRITE      # who wrote what and when
 deltalens audit ./transactions --since 2026-04-01 --op DELETE,MERGE
-deltalens schema s3://my-bucket/transactions --history     # schema on S3
+deltalens schema gs://my-bucket/transactions --history     # recursive schema evolution on GCS
 ```
 
-Native Rust binary, ~5 MB, minimal runtime dependencies. Parses `_delta_log/*.json` commit files in
-parallel across all CPU cores using Rayon's work-stealing scheduler.
+Native Rust binary that reads Delta Lake transaction logs directly — including JSON commits, classic and multi-part Parquet checkpoints, V2 checkpoints with `_sidecars/`, log compaction files (`.compacted.json`), Deletion Vectors, Column Mapping, and Liquid Clustering.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![CI](https://github.com/sandy-sachin7/datalens/actions/workflows/ci.yml/badge.svg)](https://github.com/sandy-sachin7/datalens/actions)
 
 ---
@@ -27,7 +26,7 @@ parallel across all CPU cores using Rayon's work-stealing scheduler.
 curl -fsSL https://raw.githubusercontent.com/sandy-sachin7/datalens/main/scripts/install.sh | bash
 ```
 
-Auto-detects OS and architecture, downloads from GitHub Releases, verifies SHA256.
+Auto-detects OS and architecture, downloads from GitHub Releases, and strictly verifies SHA-256 checksums before installing.
 
 **Windows (PowerShell)**
 
@@ -38,7 +37,11 @@ irm https://raw.githubusercontent.com/sandy-sachin7/datalens/main/scripts/instal
 **Cargo**
 
 ```bash
+# Full build with S3, GCS, and Azure object storage backends (default)
 cargo install deltalens
+
+# Local-only minimal build (no cloud SDKs)
+cargo install deltalens --no-default-features
 ```
 
 **Build from source**
@@ -54,70 +57,21 @@ cargo build --release
 
 ## Why not just use Spark?
 
-The standard way to inspect a Delta table today requires an active runtime:
-
-| Approach | Cold start | Dependencies | Command |
+| Approach | Cold start | Runtime required | Command |
 | :--- | :--- | :--- | :--- |
-| Spark SQL | 10–30s (JVM) | Spark cluster + drivers | `DESCRIBE HISTORY` |
-| Databricks SQL | 5–15s (warehouse) | Active SQL warehouse | `DESCRIBE HISTORY` |
-| delta-rs (Python) | 1–3s | Python + venv + deps | `DeltaTable.history()` |
-| **DeltaLens** | **<5ms** | **None** | `deltalens lineage` |
+| Spark SQL | 10–30s | JVM + Spark cluster | `DESCRIBE HISTORY` |
+| Databricks SQL | 5–15s | Active SQL warehouse | `DESCRIBE HISTORY` |
+| delta-rs (Python) | 1–3s | Python + venv + wheels | `DeltaTable.history()` |
+| **DeltaLens** | **<10ms** | **Single binary** | `deltalens lineage` |
 
-DeltaLens trades query capability for speed and zero setup. It reads only the transaction log — not
-Parquet data, not row-level content. That constraint answers 90% of observability questions (file
-counts, sizes, schema changes, operations, writers, timestamps, partition layout) in milliseconds
-instead of seconds.
+DeltaLens reads only `_delta_log/` metadata (checkpoints, sidecars, compacted logs, and JSON commits) — not Parquet data files. That answers observability questions (file counts, size skew, active tombstones, Deletion Vectors, schema evolution, breaking changes, writer attribution, partition layout) in milliseconds.
 
 **Use DeltaLens when you need:**
-- CI/CD pipeline assertions without a Spark cluster
-- Local debugging on your laptop without a notebook
-- Rapid investigation ("what changed between v10 and v20?" in 46ms)
+- CI/CD health gates (`--fail-on-issues`) and breaking-schema gates (`--fail-on-breaking`) without a Spark cluster
+- Fast local or cloud (`s3://`, `s3a://`, `gs://`, `az://`, `abfss://`) debugging from your terminal
 - Scriptable `--json` output piped into `jq` for automated monitoring
 
-**Use Spark or delta-rs when you need to read actual row data, join across tables, or run SQL.**
-
----
-
-## Quick start
-
-Point DeltaLens at any directory containing a `_delta_log/` folder:
-
-```bash
-deltalens inspect /path/to/delta-table
-```
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│  DeltaLens · Table Health Report                             │
-│  /path/to/delta-table                                        │
-├──────────────────────────────────────────────────────────────┤
-│  Current Version      │  142                                 │
-│  Created              │  2024-11-03 09:12:44 UTC             │
-│  Last Modified        │  2026-04-13 18:33:01 UTC             │
-│  Protocol             │  reader=1, writer=2                  │
-│  DATA FILES           │                                      │
-│  Total Files          │  8,432                               │
-│  Total Size           │  147.3 GB                            │
-│  Avg File Size        │  17.4 MB                             │
-│  Min File Size        │  12 KB    ← ⚠ HIGH SKEW             │
-│  Max File Size        │  891 MB   ← ⚠ HIGH SKEW             │
-│  Small Files (<32MB)  │  3,201 (38%) ← ⚠ WARNING            │
-│  Skew Score           │  0.73 / 1.0  ← ⚠ HIGH              │
-│  PARTITIONS           │                                      │
-│  Partition Columns    │  year, month                         │
-│  Partition Count      │  84                                  │
-│  MAINTENANCE          │                                      │
-│  Last VACUUM          │  v128 (12 commits ago)               │
-│  Last OPTIMIZE        │  v135 (5 commits ago)                │
-│  Last CHECKPOINT      │  v140                                │
-│  Z-Order Columns      │  customer_id, event_type             │
-│  SCHEMA               │                                      │
-│  Column Count         │  23                                  │
-│  Schema Changes       │  7 (since inception)                 │
-└──────────────────────────────────────────────────────────────┘
-
-⚠  2 issues detected.
-```
+**Use Spark or delta-rs when you need to read row data, join across tables, or run SQL.**
 
 ---
 
@@ -125,219 +79,91 @@ deltalens inspect /path/to/delta-table
 
 | Command | What it does | Key flags |
 | :--- | :--- | :--- |
-| `inspect <path>` | Table health, file skew, maintenance state, schema stats | `--version <n>` |
-| `diff <path>` | File adds/removes and schema changes between two versions | `--v1 <n> --v2 <n>` |
-| `lineage <path>` | Writer attribution and operation timeline | `--last <n>`, `--since <date>` |
-| `audit <path>` | Security and compliance audit trail, filterable by op and user | `--since <date>`, `--until <date>`, `--op <ops>`, `--user <u>` |
-| `schema <path>` | Active column layout and full schema evolution history | `--history`, `--at <v>` |
-| `config` | Manage settings and local telemetry | `show`, `path`, `metrics`, `set` |
+| `inspect <path>` | Table health, file skew, tombstones, DVs, maintenance & protocol features | `--version <n>`, `--fail-on-issues` |
+| `diff <path>` | File deltas (logical & physical), partition diffs, recursive schema diffs | `--v1 <n> --v2 <n>`, `--schema-only`, `--files-only`, `--fail-on-breaking` |
+| `lineage <path>` | Writer attribution, row counts & operation timeline | `--last <n>`, `--since <YYYY-MM-DD>`, `--op <ops>`, `--user <u>` |
+| `audit <path>` | Compliance audit trail, filterable by date range, op, and user | `--since <YYYY-MM-DD>`, `--until <YYYY-MM-DD>`, `--op <ops>`, `--user <u>` |
+| `schema <path>` | Active column layout or full recursive schema evolution history | `--history`, `--at <v>` |
+| `config` | Manage settings and local telemetry | `show`, `path`, `metrics`, `set <key> <value>` |
 
 ### Global flags
 
 | Flag | Effect |
 | :--- | :--- |
-| `--json` | Machine-readable JSON output |
-| `--plain` | No ANSI colors — for CI/CD logs and plain text storage |
-| `--no-header` | Skip visual headers |
-| `--verbose` | Internal debug info |
+| `--json` | Machine-readable JSON output (supported across all commands including `config`) |
+| `--plain` | Strictly ANSI-free plain text (also honors `NO_COLOR` and non-TTY stdout) |
+| `--no-header` | Omit table headers and title banners |
+| `-v`, `--verbose` | Print checkpoint discovery, file counts, and parse warnings to stderr |
+
+### Exit codes
+
+- `0`: Success
+- `1`: Error (invalid arguments, missing table/version, version gap, storage/auth error)
+- `2`: CI gate triggered (`inspect --fail-on-issues` found issues, or `diff --fail-on-breaking` detected breaking schema changes)
 
 ---
 
 ## Usage examples
 
-### CI/CD pipeline assertions
-
-Fail a GitHub Action if small-file ratio exceeds a threshold — without spinning up a warehouse:
+### CI/CD quality & schema gates
 
 ```yaml
-- name: Assert Delta table health
+- name: Gate on table health and breaking schema changes
   run: |
-    deltalens inspect ./delta-table --json > health.json
-    SKEW=$(jq '.health.small_file_pct' health.json)
-    if (( $(echo "$SKEW > 25.0" | bc -l) )); then
-      echo "Small file ratio ${SKEW}% exceeds 25% — run OPTIMIZE before merging"
-      exit 1
-    fi
+    deltalens inspect ./delta-table --plain --fail-on-issues
+    deltalens diff ./delta-table --v1 10 --v2 20 --fail-on-breaking
 ```
 
-### Local debugging
+### Cloud object storage
+
+DeltaLens supports `s3://`, `s3a://`, `s3n://`, `gs://`, `az://`, `abfs://`, `abfss://`, and `file://` URIs via `object_store` (bounded async concurrency on Tokio):
 
 ```bash
-# "This table is slow — why?"
-deltalens inspect ./transactions            # check file skew and vacuum state
-deltalens schema ./transactions --history   # any recent schema changes?
-
-# "Who wrote version 134?"
-deltalens lineage ./transactions --last 5
-
-# "What exactly changed between the last two releases?"
-deltalens diff ./transactions --v1 130 --v2 142
+deltalens inspect s3://my-bucket/warehouse/transactions
+deltalens diff gs://my-bucket/warehouse/transactions --v1 100 --v2 150
+deltalens schema abfss://container@account.dfs.core.windows.net/transactions --history
 ```
 
-### S3 tables
+#### S3 environment variables
 
-```bash
-# Inspect a table stored in S3
-deltalens inspect s3://my-bucket/transactions
+| Setting | Environment variable(s) |
+| :--- | :--- |
+| Access keys | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN` |
+| Region | `AWS_REGION` or `AWS_DEFAULT_REGION` |
+| Custom endpoint | `AWS_ENDPOINT` (MinIO, Cloudflare R2, LocalStack) |
+| Plain HTTP (local dev) | `AWS_ALLOW_HTTP=true` |
+| IAM / OIDC roles | Automatic on EC2/ECS/EKS, or `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN` |
 
-# Diff two versions on S3
-deltalens diff s3://my-bucket/transactions --v1 100 --v2 150
-
-# Lineage for an S3 table
-deltalens lineage s3://my-bucket/transactions --last 10
-
-# Audit on S3
-deltalens audit s3://my-bucket/transactions --since 2026-04-01
-
-# Schema evolution on S3
-deltalens schema s3://my-bucket/transactions --history
-```
-
-### S3 authentication
-
-DeltaLens uses the standard AWS credential chain — no special flags needed:
-
-| Mechanism | How to use |
-|---|---|
-| **Access keys** | Set `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ `AWS_SESSION_TOKEN` for temp creds) |
-| **Named profile** | Set `AWS_PROFILE=<name>` (defaults to `default` in `~/.aws/credentials`) |
-| **IAM role** | Works automatically on EC2, ECS, EKS, Lambda |
-| **WebIdentity/SSO** | `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`, or `aws sso login` |
-
-| Setting | Env var | Example |
-|---|---|---|
-| Region | `AWS_REGION` or `AWS_DEFAULT_REGION` | `us-east-1` |
-| Custom endpoint | `AWS_ENDPOINT` | `https://s3.us-west-2.amazonaws.com` |
-| Allow HTTP (MinIO) | `AWS_S3_ALLOW_HTTP` | `true` |
-
-If credentials are missing, DeltaLens prints a detailed error showing exactly which env vars
-or mechanisms to configure.
-
-### Databricks notebook cell
-
-```python
-# Quick table check without spark.sql() — paste into any notebook cell
-import subprocess, json
-
-result = subprocess.run(
-    ["deltalens", "inspect", "/dbfs/user/hive/warehouse/transactions", "--json"],
-    capture_output=True, text=True
-)
-health = json.loads(result.stdout)
-print(f"Skew score: {health['health']['skew_score']} | Small files: {health['health']['small_file_pct']}%")
-```
-
-### JSON output and scripting
-
-```bash
-# Check skew score
-deltalens inspect ./transactions --json | jq '.health.skew_score'
-
-# List all DELETE operations in Q1 2026
-deltalens audit ./transactions --since 2026-01-01 --until 2026-03-31 --op DELETE --json \
-  | jq '.[] | {version, timestamp, user_name}'
-
-# Count schema changes
-deltalens schema ./transactions --history --json | jq 'length'
-```
-
----
-
-## Performance
-
-DeltaLens parses commit files in parallel using Rayon's work-stealing scheduler. Each commit file
-is independent JSON — the workload is embarrassingly parallel.
-
-The JSON parser uses direct-to-struct deserialization, bypassing intermediate `serde_json::Value`
-trees. This eliminates allocation pressure on the hot path and results in a 4–8x throughput
-improvement over a naive parse-then-map approach.
-
-### Benchmarks
-
-Hardware: x86_64, 4 cores (8 threads). Methodology: median of 10 Criterion runs, cold filesystem
-cache between runs (page cache dropped). Fixtures generated by `scripts/gen_fixture.py`.
-
-| Fixture | Commits | Add/Remove actions | Parse latency (P99) | CLI wall-clock |
-| :--- | :--- | :--- | :--- | :--- |
-| Small | 100 | 1,000 | 444 µs | 5 ms |
-| Medium | 1,000 | 50,000 | 7.3 ms | 46 ms |
-| Large | 5,000 | 500,000 | 67 ms | 449 ms |
-
-Throughput: ~7.4M actions/second on the large fixture.
-
-### Reproduce
-
-```bash
-python3 scripts/gen_fixture.py   # generate small/medium/large fixtures
-cargo bench                       # run Criterion suite
-```
+*(Note: `object_store` reads environment variables and IMDS/OIDC directly; if using a named AWS CLI profile, export credentials to the environment first.)*
 
 ---
 
 ## Telemetry
 
-DeltaLens includes opt-in, fully local telemetry. Nothing is collected or transmitted by default.
+DeltaLens includes opt-in, strictly local telemetry. Nothing is collected or transmitted by default.
 
 ```bash
 deltalens config set telemetry true   # opt in
-deltalens config metrics              # view aggregated latency stats (P50, P95, P99)
+deltalens config metrics              # view P50/P95/P99 latencies and command counts
+deltalens config metrics --json       # machine-readable metrics summary
 ```
 
-When enabled, the following is recorded locally to `~/.local/share/deltalens/metrics.jsonl`:
-- Command name, version, duration
-- File and action counts
-- Timestamp (no user identifiers, no table paths, no data)
-
-Nothing is sent to any remote server.
+Metrics are written locally under `$DELTALENS_DATA_DIR`, `$XDG_DATA_HOME/deltalens`, `~/.local/share/deltalens`, or `%LOCALAPPDATA%\deltalens`. Nothing is ever sent over the network.
 
 ---
 
 ## Architecture
 
-DeltaLens reads only `_delta_log/*.json` commit files. It does not read Parquet data files and
-cannot execute SQL or evaluate predicates against row data.
-
-The parsing pipeline:
-
-1. Enumerate commit files in the requested version range
-2. Dispatch to a Rayon parallel iterator — one task per commit file
-3. Each task: open file, stream-deserialize directly into typed action structs
-4. Merge results into a single state representation
-5. Render to ANSI table or serialize to JSON
-
-There are no intermediate object trees, no heap-allocated `serde_json::Value` nodes on the hot
-path, and no synchronization between parse tasks (merge is a final sequential reduce).
+1. **Single-listing discovery**: Lists `_delta_log/` non-recursively once per command, cataloging strict 20-digit commits, classic/multi-part Parquet checkpoints, V2 JSON/Parquet checkpoints, `_last_checkpoint`, and `.compacted.json` files.
+2. **Checkpoint-accelerated replay**: Snapshot commands (`inspect`, `schema`, `diff`) start from the latest complete checkpoint `<= target_version`, resolve V2 `_sidecars/` Parquet files, and replay only subsequent commits.
+3. **Concurrent I/O + parallel parse**: Cloud backends batch-read with bounded Tokio `buffer_unordered` concurrency; local disk and JSON/Parquet parsing parallelize via Rayon.
+4. **Protocol-compliant state machine**: Applies same-commit `remove` before `add`, percent-decodes paths, keys active files by `(canonical_path, dv_unique_id)`, enriches missing `Remove.size` from prior state, and tracks active tombstones, live partitions, protocol features, and `delta.clustering` domain metadata.
 
 ---
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). All contributors must follow the [Code of Conduct](CODE_OF_CONDUCT.md).
-
-Good first contributions: additional health metrics in `inspect`, new output fields in `lineage`,
-or Azure Blob / GCS storage backends via the `object_store` crate (S3 is already implemented).
-
----
-
-## Changelog
-
-### v1.1.0 — 2026-05-22
-
-- **S3 object storage support**: `s3://bucket/prefix` paths work for `inspect`, `diff`, `lineage`,
-  `audit`, and `schema`. `file:///abs/path` URIs also supported. Uses the standard AWS credential
-  chain (env vars, `~/.aws/credentials`, IAM roles). Binary size increased to ~5 MB for S3 support
-  (tokio, reqwest, rustls).
-
-### v1.0.0 — 2026-05-22
-
-- **delta-rs compatibility fix**: `operationMetrics` values emitted as integers by delta-rs
-  (e.g. `"num_added_files": 1`) are now accepted alongside the Delta protocol standard string
-  format (`"num_added_files": "1"`). Both `inspect` and `lineage` handle the mixed types
-  transparently.
-- **Removed stale hint**: The `inspect` output no longer suggests the non-existent `suggest`
-  subcommand.
-- **Exhaustive test suite**: 80 edge-case tests covering corrupted logs, partitioned tables,
-  500+ version stress tables, all Delta data types, schema evolution, and more.
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
 ## License
 

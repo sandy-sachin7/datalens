@@ -1,33 +1,104 @@
 use crate::core::model::action::Action;
-use crate::core::parser::commit::CommitParser;
+use crate::core::parser::checkpoint::{parse_parquet_checkpoint, LastCheckpoint};
+use crate::core::parser::commit::{CommitParser, ParseWarning};
 use crate::core::storage::StorageBackend;
 use crate::error::DeltaLensError;
 use rayon::prelude::*;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::OnceLock;
 
 /// One version entry: its number, file path, and parsed actions.
+#[derive(Debug, Clone)]
 pub struct CommitEntry {
     pub version: u64,
-    #[allow(dead_code)]
     pub path: String,
     pub actions: Vec<Action>,
 }
 
+/// Complete checkpoint representation discovered in `_delta_log/`.
+#[derive(Debug, Clone)]
+pub enum CheckpointKind {
+    ClassicParquet(String),
+    MultiPartParquet {
+        total_parts: u32,
+        parts: Vec<String>,
+    },
+    V2Json(String),
+    V2Parquet(String),
+}
+
+/// A Delta log compaction file covering `[start_version, end_version]`.
+#[derive(Debug, Clone)]
+pub struct CompactedFile {
+    pub start_version: u64,
+    pub end_version: u64,
+    pub path: String,
+}
+
+/// Cached inventory of `_delta_log/` produced by a single directory listing.
+#[derive(Debug, Clone, Default)]
+pub struct LogInventory {
+    pub commits: BTreeMap<u64, String>,
+    pub checkpoints: BTreeMap<u64, CheckpointKind>,
+    pub compactions: Vec<CompactedFile>,
+    pub last_checkpoint_hint: Option<u64>,
+}
+
+impl LogInventory {
+    pub fn max_version(&self) -> Option<u64> {
+        let max_commit = self.commits.keys().next_back().copied();
+        let max_ckpt = self.checkpoints.keys().next_back().copied();
+        let max_compact = self.compactions.iter().map(|c| c.end_version).max();
+        [max_commit, max_ckpt, max_compact]
+            .into_iter()
+            .flatten()
+            .max()
+    }
+
+    pub fn min_version(&self) -> Option<u64> {
+        let min_commit = self.commits.keys().next().copied();
+        let min_ckpt = self.checkpoints.keys().next().copied();
+        let min_compact = self.compactions.iter().map(|c| c.start_version).min();
+        [min_commit, min_ckpt, min_compact]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    /// Return the latest complete checkpoint version `<= target`.
+    pub fn latest_checkpoint_le(&self, target: u64) -> Option<(u64, &CheckpointKind)> {
+        self.checkpoints
+            .range(..=target)
+            .next_back()
+            .map(|(v, k)| (*v, k))
+    }
+}
+
+/// Checkpoint-accelerated log slice for reconstructing state at `target_version`.
+#[derive(Debug, Clone)]
+pub struct SnapshotLog {
+    pub target_version: u64,
+    pub checkpoint_version: Option<u64>,
+    pub checkpoint_actions: Vec<Action>,
+    pub commits: Vec<CommitEntry>,
+    pub warnings: Vec<ParseWarning>,
+    pub files_read: usize,
+}
+
 /// Entry point for all Delta log reading operations.
 pub struct DeltaLogReader {
-    #[allow(dead_code)]
     pub table_root: String,
     pub log_subpath: String,
     pub storage: Box<dyn StorageBackend>,
+    inventory_cache: OnceLock<LogInventory>,
 }
 
 impl DeltaLogReader {
     /// Create a reader for a Delta table using the given storage backend.
-    /// `table_root` is the root URI/path of the table (e.g. "/data/table" or "s3://bucket/table").
     pub fn new(storage: Box<dyn StorageBackend>, table_root: &str) -> Result<Self, DeltaLensError> {
         let log_subpath = "_delta_log".to_string();
 
-        // Validate that the log directory exists
-        if !storage.exists(&log_subpath)? {
+        if !storage.is_dir(&log_subpath)? {
             return Err(DeltaLensError::NotADeltaTable(table_root.to_string()));
         }
 
@@ -35,123 +106,554 @@ impl DeltaLogReader {
             table_root: table_root.to_string(),
             log_subpath,
             storage,
+            inventory_cache: OnceLock::new(),
         })
     }
 
-    /// Read all commit files in version range [from, to] (inclusive).
-    /// Files are parsed IN PARALLEL via rayon — the core performance lever.
+    /// Discover and cache all commits, checkpoints, and compaction files with a SINGLE listing.
+    pub fn inventory(&self) -> Result<&LogInventory, DeltaLensError> {
+        if let Some(inv) = self.inventory_cache.get() {
+            return Ok(inv);
+        }
+
+        let entries = self.storage.list(&self.log_subpath)?;
+        let mut commits = BTreeMap::new();
+        let mut classic_ckpts: BTreeMap<u64, String> = BTreeMap::new();
+        let mut v2_json_ckpts: BTreeMap<u64, String> = BTreeMap::new();
+        let mut v2_parquet_ckpts: BTreeMap<u64, String> = BTreeMap::new();
+        let mut multipart_parts: HashMap<(u64, u32), BTreeMap<u32, String>> = HashMap::new();
+        let mut compactions = Vec::new();
+        let mut has_last_checkpoint = false;
+
+        for path_str in entries {
+            let Some(name) = basename(&path_str) else {
+                continue;
+            };
+            if name == "_last_checkpoint" {
+                has_last_checkpoint = true;
+                continue;
+            }
+            if let Some(v) = parse_commit_filename(name) {
+                commits.insert(v, path_str);
+                continue;
+            }
+            if let Some((start, end)) = parse_compacted_filename(name) {
+                compactions.push(CompactedFile {
+                    start_version: start,
+                    end_version: end,
+                    path: path_str,
+                });
+                continue;
+            }
+            if let Some(ckpt) = parse_checkpoint_filename(name) {
+                match ckpt {
+                    ParsedCheckpointFile::Classic(v) => {
+                        classic_ckpts.insert(v, path_str);
+                    }
+                    ParsedCheckpointFile::MultiPart {
+                        version,
+                        part,
+                        total,
+                    } => {
+                        multipart_parts
+                            .entry((version, total))
+                            .or_default()
+                            .insert(part, path_str);
+                    }
+                    ParsedCheckpointFile::V2Json(v) => {
+                        v2_json_ckpts.insert(v, path_str);
+                    }
+                    ParsedCheckpointFile::V2Parquet(v) => {
+                        v2_parquet_ckpts.insert(v, path_str);
+                    }
+                }
+            }
+        }
+
+        let mut checkpoints: BTreeMap<u64, CheckpointKind> = BTreeMap::new();
+        for (v, p) in classic_ckpts {
+            checkpoints.insert(v, CheckpointKind::ClassicParquet(p));
+        }
+        for ((version, total), parts_map) in multipart_parts {
+            if total > 0
+                && parts_map.len() == total as usize
+                && (1..=total).all(|i| parts_map.contains_key(&i))
+            {
+                let parts = (1..=total)
+                    .filter_map(|i| parts_map.get(&i).cloned())
+                    .collect();
+                checkpoints.insert(
+                    version,
+                    CheckpointKind::MultiPartParquet {
+                        total_parts: total,
+                        parts,
+                    },
+                );
+            }
+        }
+        // V2 checkpoints take precedence if both exist for the same version.
+        for (v, p) in v2_parquet_ckpts {
+            checkpoints.insert(v, CheckpointKind::V2Parquet(p));
+        }
+        for (v, p) in v2_json_ckpts {
+            checkpoints.insert(v, CheckpointKind::V2Json(p));
+        }
+
+        compactions.sort_by_key(|c| (c.start_version, std::cmp::Reverse(c.end_version)));
+
+        let last_checkpoint_hint = if has_last_checkpoint {
+            self.storage
+                .read(&format!("{}/_last_checkpoint", self.log_subpath))
+                .ok()
+                .and_then(|bytes| LastCheckpoint::parse_bytes(&bytes).ok())
+                .map(|lc| lc.version)
+        } else {
+            None
+        };
+
+        let inv = LogInventory {
+            commits,
+            checkpoints,
+            compactions,
+            last_checkpoint_hint,
+        };
+
+        Ok(self.inventory_cache.get_or_init(|| inv))
+    }
+
+    /// Current (maximum) version in the log across commits, checkpoints, and compactions.
+    pub fn current_version(&self) -> Result<u64, DeltaLensError> {
+        let inv = self.inventory()?;
+        inv.max_version().ok_or(DeltaLensError::EmptyTable)
+    }
+
+    /// Return the actual latest complete checkpoint version `<= max_version`, if any exists.
+    pub fn latest_checkpoint_version(
+        &self,
+        max_version: Option<u64>,
+    ) -> Result<Option<u64>, DeltaLensError> {
+        let inv = self.inventory()?;
+        let bound = max_version.unwrap_or(u64::MAX);
+        Ok(inv.latest_checkpoint_le(bound).map(|(v, _)| v))
+    }
+
+    /// Read a checkpoint-accelerated snapshot log at `target_version` (default: latest).
+    /// Starts from the latest complete checkpoint <= target_version (if one exists) and
+    /// replays only subsequent commits (leveraging `.compacted.json` when available).
+    pub fn read_snapshot_log(
+        &self,
+        target_version: Option<u64>,
+    ) -> Result<SnapshotLog, DeltaLensError> {
+        let inv = self.inventory()?;
+        let max_v = inv.max_version().ok_or(DeltaLensError::EmptyTable)?;
+        let target = match target_version {
+            Some(v) => {
+                if v > max_v {
+                    return Err(DeltaLensError::VersionNotFound(v));
+                }
+                v
+            }
+            None => max_v,
+        };
+
+        let mut warnings = Vec::new();
+        let mut files_read = 0usize;
+
+        // Pick latest complete checkpoint <= target.
+        let (checkpoint_version, checkpoint_actions, start_after) =
+            if let Some((ckpt_v, kind)) = inv.latest_checkpoint_le(target) {
+                let (actions, ckpt_warnings, ckpt_files) = self.read_checkpoint(kind)?;
+                warnings.extend(ckpt_warnings);
+                files_read += ckpt_files;
+                (Some(ckpt_v), actions, ckpt_v.checked_add(1))
+            } else {
+                // No checkpoint <= target; must reconstruct from version 0.
+                let min_v = inv.min_version().ok_or(DeltaLensError::EmptyTable)?;
+                if target < min_v {
+                    return Err(DeltaLensError::VersionNotFound(target));
+                }
+                if min_v > 0 && !inv.commits.contains_key(&0) {
+                    return Err(DeltaLensError::VersionNotFound(0));
+                }
+                (None, Vec::new(), Some(0))
+            };
+
+        let mut commits = Vec::new();
+        if let Some(start_v) = start_after {
+            if start_v <= target {
+                let (delta_commits, delta_warnings, delta_files) =
+                    self.read_contiguous_range(inv, start_v, target, true)?;
+                commits = delta_commits;
+                warnings.extend(delta_warnings);
+                files_read += delta_files;
+            }
+        }
+
+        Ok(SnapshotLog {
+            target_version: target,
+            checkpoint_version,
+            checkpoint_actions,
+            commits,
+            warnings,
+            files_read,
+        })
+    }
+
+    /// Read all JSON commit files in version range `[from, to]` (inclusive).
     pub fn read_range(
         &self,
         from: Option<u64>,
         to: Option<u64>,
     ) -> Result<Vec<CommitEntry>, DeltaLensError> {
-        let log_files = self.discover_log_files(from, to)?;
-
-        if log_files.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Each JSON file is independently parseable — embarrassingly parallel.
-        let mut entries: Vec<CommitEntry> = log_files
-            .par_iter()
-            .map(|(version, file_path)| {
-                let data = self.storage.read(file_path)?;
-                let actions = CommitParser::parse_bytes(&data, file_path)?;
-                Ok(CommitEntry {
-                    version: *version,
-                    path: file_path.clone(),
-                    actions,
-                })
-            })
-            .collect::<Result<Vec<_>, DeltaLensError>>()?;
-
-        // Sort by version ascending after parallel collection
-        entries.sort_by_key(|e| e.version);
+        let (entries, _warnings) = self.read_range_with_warnings(from, to)?;
         Ok(entries)
     }
 
-    /// Read all commits from the beginning of the log.
-    pub fn read_all(&self) -> Result<Vec<CommitEntry>, DeltaLensError> {
-        self.read_range(None, None)
-    }
-
-    /// Read only the latest N commits. Used for `lineage --last N`.
-    pub fn read_last(&self, n: usize) -> Result<Vec<CommitEntry>, DeltaLensError> {
-        let all_files = self.discover_log_files(None, None)?;
-        let last_n: Vec<_> = all_files.into_iter().rev().take(n).collect();
-
-        let mut entries: Vec<CommitEntry> = last_n
-            .par_iter()
-            .map(|(version, file_path)| {
-                let data = self.storage.read(file_path)?;
-                let actions = CommitParser::parse_bytes(&data, file_path)?;
-                Ok(CommitEntry {
-                    version: *version,
-                    path: file_path.clone(),
-                    actions,
-                })
-            })
-            .collect::<Result<Vec<_>, DeltaLensError>>()?;
-
-        entries.sort_by_key(|e| e.version);
-        Ok(entries)
-    }
-
-    /// Current (maximum) version in the log.
-    pub fn current_version(&self) -> Result<u64, DeltaLensError> {
-        let files = self.discover_log_files(None, None)?;
-        files
-            .last()
-            .map(|(v, _)| *v)
-            .ok_or(DeltaLensError::EmptyTable)
-    }
-
-    /// Discover all JSON commit files and return (version, path) sorted ascending.
-    fn discover_log_files(
+    /// Read JSON commit files in `[from, to]` (inclusive), returning structured parse warnings.
+    pub fn read_range_with_warnings(
         &self,
         from: Option<u64>,
         to: Option<u64>,
-    ) -> Result<Vec<(u64, String)>, DeltaLensError> {
-        let entries = self.storage.list(&self.log_subpath)?;
+    ) -> Result<(Vec<CommitEntry>, Vec<ParseWarning>), DeltaLensError> {
+        let inv = self.inventory()?;
+        let selected: Vec<(u64, String)> = inv
+            .commits
+            .iter()
+            .filter(|(&v, _)| {
+                from.map(|f| v >= f).unwrap_or(true) && to.map(|t| v <= t).unwrap_or(true)
+            })
+            .map(|(&v, p)| (v, p.clone()))
+            .collect();
 
-        let mut files = Vec::new();
-        for path_str in entries {
-            // Only JSON commit files — skip .parquet checkpoints and _last_checkpoint
-            if !path_str.ends_with(".json") {
-                continue;
-            }
+        if selected.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
 
-            if let Some(version) = Self::extract_version(&path_str) {
-                let in_range = match (from, to) {
-                    (Some(f), Some(t)) => version >= f && version <= t,
-                    (Some(f), None) => version >= f,
-                    (None, Some(t)) => version <= t,
-                    (None, None) => true,
-                };
-
-                if in_range {
-                    files.push((version, path_str));
+        // Validate contiguity across selected commits when a specific subrange is requested.
+        for window in selected.windows(2) {
+            let prev = window[0].0;
+            let curr = window[1].0;
+            if curr != prev + 1 {
+                let covered_by_compaction = inv
+                    .compactions
+                    .iter()
+                    .any(|c| c.start_version <= prev + 1 && c.end_version >= curr - 1);
+                if !covered_by_compaction {
+                    return Err(DeltaLensError::VersionGap {
+                        expected: prev + 1,
+                        found: curr,
+                    });
                 }
             }
         }
 
-        files.sort_by_key(|(v, _)| *v);
-        Ok(files)
+        self.load_and_parse_commits(&selected)
     }
 
-    /// Extract version number from filename: `0000000000000000142.json` → `142`
-    fn extract_version(path_str: &str) -> Option<u64> {
-        // Handle paths like "/abs/path/00042.json" or "s3://bucket/.../00042.json"
-        let filename = std::path::Path::new(path_str).file_stem()?.to_str()?;
-        filename.parse::<u64>().ok()
+    /// Read all available JSON commits.
+    pub fn read_all(&self) -> Result<Vec<CommitEntry>, DeltaLensError> {
+        self.read_range(None, None)
     }
+
+    /// Read all available JSON commits along with structured parse warnings.
+    pub fn read_all_with_warnings(
+        &self,
+    ) -> Result<(Vec<CommitEntry>, Vec<ParseWarning>), DeltaLensError> {
+        self.read_range_with_warnings(None, None)
+    }
+
+    /// Read only the latest N commits.
+    pub fn read_last(&self, n: usize) -> Result<Vec<CommitEntry>, DeltaLensError> {
+        let (entries, _warnings) = self.read_last_with_warnings(n)?;
+        Ok(entries)
+    }
+
+    /// Read only the latest N commits along with structured parse warnings.
+    pub fn read_last_with_warnings(
+        &self,
+        n: usize,
+    ) -> Result<(Vec<CommitEntry>, Vec<ParseWarning>), DeltaLensError> {
+        if n == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let inv = self.inventory()?;
+        let mut selected: Vec<(u64, String)> = inv
+            .commits
+            .iter()
+            .rev()
+            .take(n)
+            .map(|(&v, p)| (v, p.clone()))
+            .collect();
+        selected.reverse();
+        self.load_and_parse_commits(&selected)
+    }
+
+    fn read_contiguous_range(
+        &self,
+        inv: &LogInventory,
+        start_v: u64,
+        end_v: u64,
+        allow_compactions: bool,
+    ) -> Result<(Vec<CommitEntry>, Vec<ParseWarning>, usize), DeltaLensError> {
+        let mut planned: Vec<(u64, String)> = Vec::new();
+        let mut v = start_v;
+
+        while v <= end_v {
+            // Prefer the largest compaction file starting at `v` that fits within `end_v`.
+            if allow_compactions {
+                if let Some(comp) = inv
+                    .compactions
+                    .iter()
+                    .filter(|c| c.start_version == v && c.end_version <= end_v)
+                    .max_by_key(|c| c.end_version)
+                {
+                    planned.push((comp.end_version, comp.path.clone()));
+                    match comp.end_version.checked_add(1) {
+                        Some(next) => {
+                            v = next;
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
+            }
+
+            if let Some(path) = inv.commits.get(&v) {
+                planned.push((v, path.clone()));
+                match v.checked_add(1) {
+                    Some(next) => v = next,
+                    None => break,
+                }
+            } else {
+                // Report exact gap if a higher version exists, or VersionNotFound if missing.
+                if let Some((&next_found, _)) = inv.commits.range(v..=end_v).next() {
+                    return Err(DeltaLensError::VersionGap {
+                        expected: v,
+                        found: next_found,
+                    });
+                }
+                return Err(DeltaLensError::VersionNotFound(v));
+            }
+        }
+
+        let files_read = planned.len();
+        let (entries, warnings) = self.load_and_parse_commits(&planned)?;
+        Ok((entries, warnings, files_read))
+    }
+
+    fn read_checkpoint(
+        &self,
+        kind: &CheckpointKind,
+    ) -> Result<(Vec<Action>, Vec<ParseWarning>, usize), DeltaLensError> {
+        let mut actions = Vec::new();
+        let mut warnings = Vec::new();
+        let mut files_read = 0usize;
+
+        match kind {
+            CheckpointKind::ClassicParquet(path) | CheckpointKind::V2Parquet(path) => {
+                let bytes = self.storage.read(path)?;
+                files_read += 1;
+                let parsed = parse_parquet_checkpoint(&bytes, path)?;
+                actions.extend(parsed.actions);
+                warnings.extend(parsed.warnings);
+            }
+            CheckpointKind::MultiPartParquet { parts, .. } => {
+                let raw = self.storage.read_many(parts)?;
+                files_read += raw.len();
+                let parsed_results: Result<Vec<_>, DeltaLensError> = raw
+                    .par_iter()
+                    .map(|(path, bytes)| parse_parquet_checkpoint(bytes, path))
+                    .collect();
+                for pr in parsed_results? {
+                    actions.extend(pr.actions);
+                    warnings.extend(pr.warnings);
+                }
+            }
+            CheckpointKind::V2Json(path) => {
+                let bytes = self.storage.read(path)?;
+                files_read += 1;
+                let parsed = CommitParser::parse_bytes_with_warnings(&bytes, path)?;
+                actions.extend(parsed.actions);
+                warnings.extend(parsed.warnings);
+            }
+        }
+
+        // Resolve V2 checkpoint sidecar files (`_delta_log/_sidecars/<path>`).
+        let sidecar_paths: Vec<String> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Sidecar(sc) => {
+                    let clean = sc.path.trim_start_matches('/');
+                    Some(format!("{}/_sidecars/{}", self.log_subpath, clean))
+                }
+                _ => None,
+            })
+            .collect();
+
+        if !sidecar_paths.is_empty() {
+            let sidecar_blobs = self.storage.read_many(&sidecar_paths)?;
+            files_read += sidecar_blobs.len();
+            let parsed_sidecars: Result<Vec<_>, DeltaLensError> = sidecar_blobs
+                .par_iter()
+                .map(|(path, bytes)| parse_parquet_checkpoint(bytes, path))
+                .collect();
+            for pr in parsed_sidecars? {
+                actions.extend(pr.actions);
+                warnings.extend(pr.warnings);
+            }
+        }
+
+        Ok((actions, warnings, files_read))
+    }
+
+    fn load_and_parse_commits(
+        &self,
+        files: &[(u64, String)],
+    ) -> Result<(Vec<CommitEntry>, Vec<ParseWarning>), DeltaLensError> {
+        if files.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        let version_by_path: HashMap<&str, u64> =
+            files.iter().map(|(v, p)| (p.as_str(), *v)).collect();
+        let paths: Vec<String> = files.iter().map(|(_, p)| p.clone()).collect();
+
+        // Batch read via backend (bounded Tokio async on cloud, Rayon on local disk).
+        let raw_files = self.storage.read_many(&paths)?;
+
+        // Parse JSON in parallel with Rayon (CPU-bound, zero nested Tokio calls!).
+        let parsed: Result<Vec<(CommitEntry, Vec<ParseWarning>)>, DeltaLensError> = raw_files
+            .par_iter()
+            .map(|(path, bytes)| {
+                let version = *version_by_path.get(path.as_str()).ok_or_else(|| {
+                    DeltaLensError::Storage(format!("Unexpected path returned by storage: {path}"))
+                })?;
+                let res = CommitParser::parse_bytes_with_warnings(bytes, path)?;
+                Ok((
+                    CommitEntry {
+                        version,
+                        path: path.clone(),
+                        actions: res.actions,
+                    },
+                    res.warnings,
+                ))
+            })
+            .collect();
+
+        let mut pairs = parsed?;
+        pairs.sort_by_key(|(entry, _)| entry.version);
+
+        let mut entries = Vec::with_capacity(pairs.len());
+        let mut warnings = Vec::new();
+        for (entry, w) in pairs {
+            entries.push(entry);
+            warnings.extend(w);
+        }
+
+        Ok((entries, warnings))
+    }
+}
+
+enum ParsedCheckpointFile {
+    Classic(u64),
+    MultiPart { version: u64, part: u32, total: u32 },
+    V2Json(u64),
+    V2Parquet(u64),
+}
+
+fn basename(path: &str) -> Option<&str> {
+    path.rsplit(['/', '\\']).next().filter(|s| !s.is_empty())
+}
+
+fn is_20_digits(s: &str) -> bool {
+    s.len() == 20 && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Strict 20-digit zero-padded Delta commit filename: `00000000000000000142.json`.
+pub fn parse_commit_filename(filename: &str) -> Option<u64> {
+    let stem = filename.strip_suffix(".json")?;
+    if !is_20_digits(stem) {
+        return None;
+    }
+    stem.parse::<u64>().ok()
+}
+
+/// Delta log compaction filename: `<20-digits>.<20-digits>.compacted.json`.
+pub fn parse_compacted_filename(filename: &str) -> Option<(u64, u64)> {
+    let stem = filename.strip_suffix(".compacted.json")?;
+    let (a, b) = stem.split_once('.')?;
+    if !is_20_digits(a) || !is_20_digits(b) {
+        return None;
+    }
+    let start = a.parse::<u64>().ok()?;
+    let end = b.parse::<u64>().ok()?;
+    if start <= end {
+        Some((start, end))
+    } else {
+        None
+    }
+}
+
+/// Parse classic, multi-part, and V2 JSON/Parquet checkpoint filenames.
+fn parse_checkpoint_filename(filename: &str) -> Option<ParsedCheckpointFile> {
+    let (ver_str, rest) = filename.split_once(".checkpoint.")?;
+    if !is_20_digits(ver_str) {
+        return None;
+    }
+    let version = ver_str.parse::<u64>().ok()?;
+
+    if rest == "parquet" {
+        return Some(ParsedCheckpointFile::Classic(version));
+    }
+
+    if let Some(stem) = rest.strip_suffix(".parquet") {
+        // Multi-part: <10 digits>.<10 digits>
+        if let Some((p_str, t_str)) = stem.split_once('.') {
+            if p_str.len() == 10
+                && t_str.len() == 10
+                && p_str.bytes().all(|b| b.is_ascii_digit())
+                && t_str.bytes().all(|b| b.is_ascii_digit())
+            {
+                let part = p_str.parse::<u32>().ok()?;
+                let total = t_str.parse::<u32>().ok()?;
+                if part >= 1 && part <= total {
+                    return Some(ParsedCheckpointFile::MultiPart {
+                        version,
+                        part,
+                        total,
+                    });
+                }
+            }
+            return None;
+        }
+        // V2 Parquet: <uuid>.parquet
+        if !stem.is_empty() && !stem.contains('.') {
+            return Some(ParsedCheckpointFile::V2Parquet(version));
+        }
+        return None;
+    }
+
+    if let Some(uuid) = rest.strip_suffix(".json") {
+        if !uuid.is_empty() && !uuid.contains('.') {
+            return Some(ParsedCheckpointFile::V2Json(version));
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::storage::LocalStorage;
+    use arrow_array::builder::{
+        BooleanBuilder, Int32Builder, Int64Builder, StringBuilder, StructBuilder,
+    };
+    use arrow_array::RecordBatch;
+    use arrow_schema::{DataType as ArrowDataType, Field, Fields, Schema};
+    use parquet::arrow::ArrowWriter;
     use std::io::Write;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     fn make_commit(dir: &std::path::Path, version: u64, content: &str) {
@@ -166,6 +668,69 @@ mod tests {
         DeltaLogReader::new(storage, &root).unwrap()
     }
 
+    fn write_parquet_add_file(path: &std::path::Path, file_path: &str, size: i64) {
+        let add_fields = Fields::from(vec![
+            Field::new("path", ArrowDataType::Utf8, false),
+            Field::new("size", ArrowDataType::Int64, false),
+            Field::new("modificationTime", ArrowDataType::Int64, false),
+            Field::new("dataChange", ArrowDataType::Boolean, false),
+        ]);
+        let proto_fields = Fields::from(vec![
+            Field::new("minReaderVersion", ArrowDataType::Int32, false),
+            Field::new("minWriterVersion", ArrowDataType::Int32, false),
+        ]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "protocol",
+                ArrowDataType::Struct(proto_fields.clone()),
+                true,
+            ),
+            Field::new("add", ArrowDataType::Struct(add_fields.clone()), true),
+        ]));
+
+        let mut pb = StructBuilder::new(
+            proto_fields,
+            vec![Box::new(Int32Builder::new()), Box::new(Int32Builder::new())],
+        );
+        pb.field_builder::<Int32Builder>(0).unwrap().append_value(1);
+        pb.field_builder::<Int32Builder>(1).unwrap().append_value(2);
+        pb.append(true);
+
+        let mut ab = StructBuilder::new(
+            add_fields,
+            vec![
+                Box::new(StringBuilder::new()),
+                Box::new(Int64Builder::new()),
+                Box::new(Int64Builder::new()),
+                Box::new(BooleanBuilder::new()),
+            ],
+        );
+        ab.field_builder::<StringBuilder>(0)
+            .unwrap()
+            .append_value(file_path);
+        ab.field_builder::<Int64Builder>(1)
+            .unwrap()
+            .append_value(size);
+        ab.field_builder::<Int64Builder>(2)
+            .unwrap()
+            .append_value(1700000000000);
+        ab.field_builder::<BooleanBuilder>(3)
+            .unwrap()
+            .append_value(false);
+        ab.append(true);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(pb.finish()), Arc::new(ab.finish())],
+        )
+        .unwrap();
+
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
     #[test]
     fn test_reject_non_delta_path() {
         let tmp = TempDir::new().unwrap();
@@ -173,6 +738,17 @@ mod tests {
         let storage = Box::new(LocalStorage::new(root.clone()));
         let result = DeltaLogReader::new(storage, &root);
         assert!(matches!(result, Err(DeltaLensError::NotADeltaTable(_))));
+    }
+
+    #[test]
+    fn test_strict_20_digit_filenames() {
+        assert_eq!(parse_commit_filename("00000000000000000042.json"), Some(42));
+        assert_eq!(parse_commit_filename("42.json"), None);
+        assert_eq!(parse_commit_filename("00000000000000000042.crc"), None);
+        assert_eq!(
+            parse_compacted_filename("00000000000000000001.00000000000000000005.compacted.json"),
+            Some((1, 5))
+        );
     }
 
     #[test]
@@ -185,12 +761,200 @@ mod tests {
         make_commit(&log_dir, 0, action);
         make_commit(&log_dir, 1, action);
         make_commit(&log_dir, 2, action);
+        // Non-20-digit stray JSON file must be ignored
+        std::fs::write(log_dir.join("999.json"), action).unwrap();
 
         let reader = create_reader(&tmp);
         let entries = reader.read_all().unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].version, 0);
         assert_eq!(entries[2].version, 2);
+    }
+
+    #[test]
+    fn test_detects_version_gap() {
+        let tmp = TempDir::new().unwrap();
+        let log_dir = tmp.path().join("_delta_log");
+        std::fs::create_dir(&log_dir).unwrap();
+        let action = r#"{"commitInfo":{"timestamp":1700000000000,"operation":"WRITE"}}"#;
+        make_commit(&log_dir, 0, action);
+        make_commit(&log_dir, 2, action);
+
+        let reader = create_reader(&tmp);
+        let err = reader.read_snapshot_log(Some(2)).unwrap_err();
+        assert!(matches!(
+            err,
+            DeltaLensError::VersionGap {
+                expected: 1,
+                found: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn test_reads_classic_parquet_checkpoint_with_expired_commits() {
+        let tmp = TempDir::new().unwrap();
+        let log_dir = tmp.path().join("_delta_log");
+        std::fs::create_dir(&log_dir).unwrap();
+
+        // Commits 0..=9 are expired (absent), checkpoint exists at v10, commit 11 follows.
+        write_parquet_add_file(
+            &log_dir.join("00000000000000000010.checkpoint.parquet"),
+            "part-from-ckpt.parquet",
+            5000,
+        );
+        std::fs::write(
+            log_dir.join("_last_checkpoint"),
+            r#"{"version":10,"size":2}"#,
+        )
+        .unwrap();
+        make_commit(
+            &log_dir,
+            11,
+            r#"{"add":{"path":"part-v11.parquet","size":3000,"modificationTime":1700000002000,"dataChange":true,"partitionValues":{}}}"#,
+        );
+
+        let reader = create_reader(&tmp);
+        assert_eq!(reader.current_version().unwrap(), 11);
+        assert_eq!(reader.latest_checkpoint_version(None).unwrap(), Some(10));
+
+        let snap = reader.read_snapshot_log(None).unwrap();
+        assert_eq!(snap.checkpoint_version, Some(10));
+        assert_eq!(snap.commits.len(), 1);
+        assert_eq!(snap.commits[0].version, 11);
+        assert!(snap
+            .checkpoint_actions
+            .iter()
+            .any(|a| matches!(a, Action::Add(_))));
+    }
+
+    #[test]
+    fn test_reads_multipart_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let log_dir = tmp.path().join("_delta_log");
+        std::fs::create_dir(&log_dir).unwrap();
+
+        write_parquet_add_file(
+            &log_dir.join("00000000000000000020.checkpoint.0000000001.0000000002.parquet"),
+            "part-a.parquet",
+            1000,
+        );
+        write_parquet_add_file(
+            &log_dir.join("00000000000000000020.checkpoint.0000000002.0000000002.parquet"),
+            "part-b.parquet",
+            2000,
+        );
+
+        let reader = create_reader(&tmp);
+        let snap = reader.read_snapshot_log(None).unwrap();
+        assert_eq!(snap.checkpoint_version, Some(20));
+        let add_count = snap
+            .checkpoint_actions
+            .iter()
+            .filter(|a| matches!(a, Action::Add(_)))
+            .count();
+        assert_eq!(add_count, 2);
+    }
+
+    #[test]
+    fn test_reads_v2_json_checkpoint_with_sidecar_and_compacted_json() {
+        let tmp = TempDir::new().unwrap();
+        let log_dir = tmp.path().join("_delta_log");
+        let sidecars = log_dir.join("_sidecars");
+        std::fs::create_dir_all(&sidecars).unwrap();
+
+        write_parquet_add_file(&sidecars.join("sc-1.parquet"), "from-sidecar.parquet", 7777);
+
+        let v2_ckpt = concat!(
+            r#"{"checkpointMetadata":{"version":2}}"#,
+            "\n",
+            r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["v2Checkpoint"],"writerFeatures":["v2Checkpoint"]}}"#,
+            "\n",
+            r#"{"sidecar":{"path":"sc-1.parquet","sizeInBytes":100,"modificationTime":1000}}"#,
+            "\n"
+        );
+        std::fs::write(
+            log_dir.join("00000000000000000005.checkpoint.abcd-1234.json"),
+            v2_ckpt,
+        )
+        .unwrap();
+
+        // Compacted file covers versions 6..=8 (without needing individual 6, 7, 8 JSON files)
+        std::fs::write(
+            log_dir.join("00000000000000000006.00000000000000000008.compacted.json"),
+            r#"{"add":{"path":"from-compacted.parquet","size":999,"modificationTime":2000,"dataChange":true,"partitionValues":{}}}"#,
+        )
+        .unwrap();
+
+        let reader = create_reader(&tmp);
+        assert_eq!(reader.current_version().unwrap(), 8);
+        let snap = reader.read_snapshot_log(Some(8)).unwrap();
+        assert_eq!(snap.checkpoint_version, Some(5));
+        assert!(snap
+            .checkpoint_actions
+            .iter()
+            .any(|a| matches!(a, Action::Add(add) if add.path == "from-sidecar.parquet")));
+        assert_eq!(snap.commits.len(), 1);
+        assert_eq!(snap.commits[0].version, 8);
+    }
+
+    #[test]
+    fn test_reads_v2_parquet_checkpoint_with_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let log_dir = tmp.path().join("_delta_log");
+        let sidecars = log_dir.join("_sidecars");
+        std::fs::create_dir_all(&sidecars).unwrap();
+
+        write_parquet_add_file(
+            &sidecars.join("sc-v2p.parquet"),
+            "from-v2-parquet-sidecar.parquet",
+            8888,
+        );
+
+        let sidecar_fields = Fields::from(vec![
+            Field::new("path", ArrowDataType::Utf8, false),
+            Field::new("sizeInBytes", ArrowDataType::Int64, false),
+            Field::new("modificationTime", ArrowDataType::Int64, false),
+        ]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "sidecar",
+            ArrowDataType::Struct(sidecar_fields.clone()),
+            true,
+        )]));
+        let mut sb = StructBuilder::new(
+            sidecar_fields,
+            vec![
+                Box::new(StringBuilder::new()),
+                Box::new(Int64Builder::new()),
+                Box::new(Int64Builder::new()),
+            ],
+        );
+        sb.field_builder::<StringBuilder>(0)
+            .unwrap()
+            .append_value("sc-v2p.parquet");
+        sb.field_builder::<Int64Builder>(1)
+            .unwrap()
+            .append_value(123);
+        sb.field_builder::<Int64Builder>(2)
+            .unwrap()
+            .append_value(1000);
+        sb.append(true);
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(sb.finish())]).unwrap();
+        let f = std::fs::File::create(
+            log_dir.join("00000000000000000007.checkpoint.550e8400-e29b-41d4.parquet"),
+        )
+        .unwrap();
+        let mut writer = ArrowWriter::try_new(f, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let reader = create_reader(&tmp);
+        let snap = reader.read_snapshot_log(Some(7)).unwrap();
+        assert_eq!(snap.checkpoint_version, Some(7));
+        assert!(snap.checkpoint_actions.iter().any(
+            |a| matches!(a, Action::Add(add) if add.path == "from-v2-parquet-sidecar.parquet")
+        ));
     }
 
     #[test]

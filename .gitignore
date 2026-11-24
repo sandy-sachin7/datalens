@@ -4,11 +4,11 @@
 # Internal AI agent context (not for public repos)
 ANTIGRAVITY.md
 
-# Generated benchmark fixtures (large, auto-generated — use scripts/gen_fixture.py to regenerate)
-# small fixture is committed as a quick smoke-test sample
-# medium (12 MB) and large (98 MB) are excluded — run scripts/gen_fixture.py to regenerate
-benches/fixtures/medium/
-benches/fixtures/large/
+# Generated benchmark and test fixtures (auto-generated — use scripts/gen_fixture.py to regenerate)
+benches/fixtures/
+stress_tables/
+edge_tables/
+test_tables/
 
 # Criterion benchmark results (HTML reports, raw data)
 criterion/

@@ -1,6 +1,6 @@
 use clap::Parser;
-use deltalens::cli::args::{Cli, Commands};
-use deltalens::cli::output_opts::OutputOpts;
+use deltalens::cli::args::{Cli, Commands, ConfigAction};
+use deltalens::cli::output_opts::{CommandOutcome, OutputOpts};
 use deltalens::core::config::DeltalensConfig;
 use deltalens::core::metrics::MetricsRecorder;
 use std::process;
@@ -12,24 +12,23 @@ fn main() {
         json: cli.json,
         plain: cli.plain,
         no_header: cli.no_header,
+        verbose: cli.verbose,
     };
 
     let app_version = cli_version();
+    let telemetry_enabled = DeltalensConfig::load().telemetry;
 
-    let result = match &cli.command {
-        Commands::Inspect { path, version } => {
+    let (cmd_name, result): (Option<&str>, Result<CommandOutcome, _>) = match &cli.command {
+        Commands::Inspect {
+            path,
+            version,
+            fail_on_issues,
+        } => {
             let recorder = MetricsRecorder::new("inspect");
-            let r = deltalens::cli::commands::inspect::execute(
-                path,
-                *version,
-                cli.json,
-                cli.plain,
-                cli.no_header,
-            );
-            if DeltalensConfig::load().telemetry && r.is_ok() {
-                recorder.finish(0, 0, 0, &app_version);
-            }
-            r
+            let r =
+                deltalens::cli::commands::inspect::execute(path, *version, *fail_on_issues, opts);
+            record_if_enabled(telemetry_enabled, &recorder, &r, &app_version);
+            (Some("inspect"), r)
         }
         Commands::Diff {
             path,
@@ -37,8 +36,20 @@ fn main() {
             v2,
             schema_only,
             files_only,
+            fail_on_breaking,
         } => {
-            deltalens::cli::commands::diff::execute(path, *v1, *v2, *schema_only, *files_only, opts)
+            let recorder = MetricsRecorder::new("diff");
+            let r = deltalens::cli::commands::diff::execute(
+                path,
+                *v1,
+                *v2,
+                *schema_only,
+                *files_only,
+                *fail_on_breaking,
+                opts,
+            );
+            record_if_enabled(telemetry_enabled, &recorder, &r, &app_version);
+            (Some("diff"), r)
         }
         Commands::Lineage {
             path,
@@ -46,58 +57,93 @@ fn main() {
             since,
             op,
             user,
-        } => deltalens::cli::commands::lineage::execute(
-            path,
-            *last,
-            since.clone(),
-            op.clone(),
-            user.clone(),
-            opts,
-        ),
+        } => {
+            let recorder = MetricsRecorder::new("lineage");
+            let r = deltalens::cli::commands::lineage::execute(
+                path,
+                *last,
+                since.clone(),
+                op.clone(),
+                user.clone(),
+                opts,
+            );
+            record_if_enabled(telemetry_enabled, &recorder, &r, &app_version);
+            (Some("lineage"), r)
+        }
         Commands::Audit {
             path,
             since,
             until,
             op,
             user,
-        } => deltalens::cli::commands::audit::execute(
-            path,
-            since.clone(),
-            until.clone(),
-            op.clone(),
-            user.clone(),
-            opts,
-        ),
+        } => {
+            let recorder = MetricsRecorder::new("audit");
+            let r = deltalens::cli::commands::audit::execute(
+                path,
+                since.clone(),
+                until.clone(),
+                op.clone(),
+                user.clone(),
+                opts,
+            );
+            record_if_enabled(telemetry_enabled, &recorder, &r, &app_version);
+            (Some("audit"), r)
+        }
         Commands::Schema { path, history, at } => {
             let recorder = MetricsRecorder::new("schema");
-            let r = deltalens::cli::commands::schema::execute(
-                path,
-                *history,
-                *at,
-                cli.json,
-                cli.plain,
-                cli.no_header,
-            );
-            if DeltalensConfig::load().telemetry && r.is_ok() {
-                recorder.finish(0, 0, 0, &app_version);
-            }
-            r
+            let r = deltalens::cli::commands::schema::execute(path, *history, *at, opts);
+            record_if_enabled(telemetry_enabled, &recorder, &r, &app_version);
+            (Some("schema"), r)
         }
-        Commands::Config { action } => match action {
-            deltalens::cli::args::ConfigAction::Show => deltalens::cli::commands::config::show(),
-            deltalens::cli::args::ConfigAction::Path => deltalens::cli::commands::config::path(),
-            deltalens::cli::args::ConfigAction::Metrics => {
-                deltalens::cli::commands::config::metrics()
-            }
-            deltalens::cli::args::ConfigAction::Set { key, value } => {
-                deltalens::cli::commands::config::set(key, value)
-            }
-        },
+        Commands::Config { action } => {
+            let r = match action {
+                ConfigAction::Show => deltalens::cli::commands::config::show(opts),
+                ConfigAction::Path => deltalens::cli::commands::config::path(opts),
+                ConfigAction::Metrics => deltalens::cli::commands::config::metrics(opts),
+                ConfigAction::Set { key, value } => {
+                    deltalens::cli::commands::config::set(key, value, opts)
+                }
+            };
+            (None, r)
+        }
     };
 
-    if let Err(e) = result {
-        eprintln!("Error: {}", e);
-        process::exit(1);
+    match result {
+        Ok(outcome) => {
+            if outcome.exit_code != 0 {
+                if opts.verbose {
+                    eprintln!(
+                        "[verbose] command {:?} exited with gate code {}",
+                        cmd_name.unwrap_or("config"),
+                        outcome.exit_code
+                    );
+                }
+                process::exit(outcome.exit_code);
+            }
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    }
+}
+
+fn record_if_enabled(
+    enabled: bool,
+    recorder: &MetricsRecorder,
+    result: &Result<CommandOutcome, deltalens::error::DeltaLensError>,
+    app_version: &str,
+) {
+    if !enabled {
+        return;
+    }
+    if let Ok(outcome) = result {
+        recorder.finish(
+            outcome.num_commits,
+            outcome.num_actions,
+            outcome.table_version,
+            app_version,
+        );
     }
 }
 

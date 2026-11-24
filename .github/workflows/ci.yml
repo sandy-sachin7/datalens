@@ -34,8 +34,15 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: cargo check (no warnings)
-        run: cargo check
+      - name: cargo check (strict warnings)
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: cargo check --all-targets --locked
+
+      - name: cargo check (local-only, no default features)
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: cargo check --no-default-features --locked
 
       - name: cargo test
         run: cargo test --locked
@@ -68,7 +75,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: cargo fmt check
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
 
       - name: cargo clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings

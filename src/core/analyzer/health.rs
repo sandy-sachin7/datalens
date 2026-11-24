@@ -1,65 +1,96 @@
+use crate::core::analyzer::schema::SchemaTracker;
 use crate::core::model::action::Action;
 use crate::core::model::schema::StructType;
 use crate::core::model::stats::{MaintenanceInfo, TableHealth, TableStats};
-use crate::core::reader::CommitEntry;
-use std::collections::HashMap;
+use crate::core::reader::{CommitEntry, SnapshotLog};
+use crate::core::replay::TableState;
 
 pub struct HealthAnalyzer;
 
 impl HealthAnalyzer {
-    /// Full table inspection from all commit entries.
-    pub fn analyze(entries: &[CommitEntry]) -> TableStats {
-        if entries.is_empty() {
-            return Self::empty_stats();
-        }
+    /// Full table inspection from a checkpoint-aware `SnapshotLog`.
+    pub fn analyze_snapshot(snapshot: &SnapshotLog) -> TableStats {
+        let state = TableState::from_snapshot(snapshot);
+        let health = Self::compute_health(&state);
+        let tombstones = state.tombstone_info();
+        let mut maintenance = Self::compute_maintenance(&snapshot.commits);
+        maintenance.last_checkpoint_version = snapshot.checkpoint_version;
+        maintenance.clustering_columns = state.clustering_columns();
 
-        // Flatten all actions for file-set reconstruction
-        let all_actions: Vec<&Action> = entries.iter().flat_map(|e| e.actions.iter()).collect();
+        let partition_columns = state
+            .metadata
+            .as_ref()
+            .map(|m| m.partition_columns.clone())
+            .unwrap_or_default();
+        let partition_count = state.active_partitions().len();
+        let empty_partition_count = state.empty_partition_count();
 
-        let health = Self::compute_health(&all_actions);
-        let maintenance = Self::compute_maintenance(entries);
-        let (partition_columns, partition_count, empty_partition_count) =
-            Self::compute_partition_info(&all_actions);
-        let (schema_column_count, schema_change_count, created_ts) =
-            Self::compute_schema_info(entries);
+        let schema_column_count = state
+            .metadata
+            .as_ref()
+            .and_then(|m| StructType::from_schema_string(&m.schema_string).ok())
+            .map(|s| s.fields.len())
+            .unwrap_or(0);
+        let schema_change_count = SchemaTracker::history_from_snapshot(snapshot).len();
 
-        let current_version = entries.last().map(|e| e.version).unwrap_or(0);
-        let last_modified = Self::find_last_modified_ts(entries);
+        let created_timestamp = Self::find_created_ts(&state, &snapshot.commits);
+        let last_modified_timestamp = Self::find_last_modified_ts(&state, &snapshot.commits);
+
+        let (min_reader_version, min_writer_version, reader_features, writer_features) =
+            match &state.protocol {
+                Some(p) => (
+                    p.min_reader_version,
+                    p.min_writer_version,
+                    p.reader_features.clone().unwrap_or_default(),
+                    p.writer_features.clone().unwrap_or_default(),
+                ),
+                None => (1, 2, Vec::new(), Vec::new()),
+            };
+
+        let warnings: Vec<String> = snapshot
+            .warnings
+            .iter()
+            .map(|w| format!("{}:{}: {}", w.path, w.line, w.message))
+            .collect();
 
         TableStats {
-            current_version,
-            created_timestamp: created_ts,
-            last_modified_timestamp: last_modified,
-            min_reader_version: Self::find_protocol_version(entries).0,
-            min_writer_version: Self::find_protocol_version(entries).1,
+            current_version: snapshot.target_version,
+            created_timestamp,
+            last_modified_timestamp,
+            min_reader_version,
+            min_writer_version,
+            reader_features,
+            writer_features,
             partition_columns,
             partition_count,
             empty_partition_count,
             schema_column_count,
             schema_change_count,
             health,
+            tombstones,
             maintenance,
+            warnings,
         }
     }
 
-    /// Compute file-level health from reconstructed active file set.
-    fn compute_health(actions: &[&Action]) -> TableHealth {
-        // Reconstruct current file set: Add adds, Remove soft-deletes
-        let mut active_files: HashMap<String, i64> = HashMap::new();
-
-        for action in actions {
-            match action {
-                Action::Add(a) => {
-                    active_files.insert(a.path.clone(), a.size);
-                }
-                Action::Remove(r) => {
-                    active_files.remove(&r.path);
-                }
-                _ => {}
-            }
+    /// Analyze a slice of commits directly (without a checkpoint).
+    pub fn analyze(entries: &[CommitEntry]) -> TableStats {
+        if entries.is_empty() {
+            return Self::empty_stats();
         }
+        let snapshot = SnapshotLog {
+            target_version: entries.last().map(|e| e.version).unwrap_or(0),
+            checkpoint_version: None,
+            checkpoint_actions: Vec::new(),
+            commits: entries.to_vec(),
+            warnings: Vec::new(),
+            files_read: entries.len(),
+        };
+        Self::analyze_snapshot(&snapshot)
+    }
 
-        let sizes: Vec<i64> = active_files.values().copied().collect();
+    fn compute_health(state: &TableState) -> TableHealth {
+        let sizes: Vec<i64> = state.active_files.values().map(|a| a.size).collect();
         let total_files = sizes.len();
         let total_size: i64 = sizes.iter().sum();
         let avg_size = if total_files > 0 {
@@ -80,6 +111,15 @@ impl HealthAnalyzer {
         let min_file_size = sizes.iter().min().copied().unwrap_or(0);
         let max_file_size = sizes.iter().max().copied().unwrap_or(0);
 
+        let mut deletion_vector_files = 0usize;
+        let mut deleted_rows_in_dvs = 0i64;
+        for add in state.active_files.values() {
+            if let Some(dv) = &add.deletion_vector {
+                deletion_vector_files += 1;
+                deleted_rows_in_dvs += dv.cardinality;
+            }
+        }
+
         TableHealth {
             total_files,
             total_size,
@@ -89,18 +129,19 @@ impl HealthAnalyzer {
             small_file_count,
             small_file_pct,
             skew_score,
+            deletion_vector_files,
+            deleted_rows_in_dvs,
         }
     }
 
     /// Coefficient of variation, normalized to [0, 1].
-    /// 0.0 = all files identical size (perfect)
-    /// 1.0 = extreme size variance (bad for query performance)
+    /// 0.0 = all files identical size (perfect), 1.0 = extreme size variance.
     pub fn compute_skew_score(sizes: &[i64]) -> f64 {
         if sizes.len() < 2 {
             return 0.0;
         }
         let mean = sizes.iter().sum::<i64>() as f64 / sizes.len() as f64;
-        if mean == 0.0 {
+        if mean <= 0.0 {
             return 0.0;
         }
         let variance = sizes
@@ -114,7 +155,6 @@ impl HealthAnalyzer {
 
         let std_dev = variance.sqrt();
         let cv = std_dev / mean;
-        // CV > 2.0 is considered maximum skew
         (cv / 2.0).min(1.0)
     }
 
@@ -126,27 +166,38 @@ impl HealthAnalyzer {
                 if let Action::CommitInfo(ci) = action {
                     let op = ci.operation.to_uppercase();
 
-                    if op == "VACUUM START" || op == "VACUUM END" {
-                        info.last_vacuum_version = Some(entry.version);
-                        info.last_vacuum_timestamp = Some(ci.timestamp);
+                    // Only count completed VACUUM END commits whose status is not FAILED.
+                    if op == "VACUUM END" {
+                        let failed = ci
+                            .operation_parameters
+                            .get("status")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.eq_ignore_ascii_case("FAILED"))
+                            .unwrap_or(false);
+                        if !failed {
+                            info.last_vacuum_version = Some(entry.version);
+                            info.last_vacuum_timestamp = Some(ci.timestamp);
+                        }
                     }
 
                     if op == "OPTIMIZE" {
                         info.last_optimize_version = Some(entry.version);
                         info.last_optimize_timestamp = Some(ci.timestamp);
 
-                        // Extract Z-ORDER columns from operationParameters
+                        // Extract Z-ORDER columns from operationParameters; preserve existing
+                        // z_order_columns across non-Z-order OPTIMIZE runs.
                         if let Some(zorder) = ci.operation_parameters.get("zOrderBy") {
-                            if let Some(arr) = zorder.as_array() {
-                                info.z_order_columns = arr
-                                    .iter()
+                            let parsed: Vec<String> = if let Some(arr) = zorder.as_array() {
+                                arr.iter()
                                     .filter_map(|v| v.as_str().map(String::from))
-                                    .collect();
+                                    .collect()
                             } else if let Some(s) = zorder.as_str() {
-                                // Sometimes stored as JSON string "[\"col1\",\"col2\"]"
-                                if let Ok(cols) = serde_json::from_str::<Vec<String>>(s) {
-                                    info.z_order_columns = cols;
-                                }
+                                serde_json::from_str::<Vec<String>>(s).unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            };
+                            if !parsed.is_empty() {
+                                info.z_order_columns = parsed;
                             }
                         }
                     }
@@ -154,106 +205,37 @@ impl HealthAnalyzer {
             }
         }
 
-        // Checkpoint: scan for .parquet files in log dir (simple heuristic)
-        // Full checkpoint parsing is v0.1.1; here we just note the latest version
-        info.last_checkpoint_version = entries
-            .iter()
-            .rev()
-            .find(|e| e.version % 10 == 0 && e.version > 0)
-            .map(|e| e.version);
-
         info
     }
 
-    fn compute_partition_info(actions: &[&Action]) -> (Vec<String>, usize, usize) {
-        let mut partition_columns: Vec<String> = vec![];
-        let mut partitions: HashMap<String, usize> = HashMap::new();
-
-        for action in actions {
-            match action {
-                Action::MetaData(m) => {
-                    partition_columns = m.partition_columns.clone();
-                }
-                Action::Add(a) if !a.partition_values.is_empty() => {
-                    // Build a stable partition key string
-                    let mut kv: Vec<_> = a.partition_values.iter().collect();
-                    kv.sort_by_key(|(k, _)| k.as_str());
-                    let key = kv
-                        .iter()
-                        .map(|(k, v)| {
-                            format!(
-                                "{}={}",
-                                k,
-                                v.as_deref().unwrap_or("__HIVE_DEFAULT_PARTITION__")
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("/");
-                    *partitions.entry(key).or_insert(0) += 1;
-                }
-                _ => {}
-            }
-        }
-
-        let partition_count = partitions.len();
-        // Partitions with 0 active files (all removed) — count those with value 0
-        let empty_partition_count = partitions.values().filter(|&&c| c == 0).count();
-
-        (partition_columns, partition_count, empty_partition_count)
-    }
-
-    fn compute_schema_info(entries: &[CommitEntry]) -> (usize, usize, Option<i64>) {
-        let mut schema_changes = 0usize;
-        let mut latest_column_count = 0usize;
-        let mut created_time: Option<i64> = None;
-        let mut prev_fields: Vec<String> = vec![];
-
+    fn find_created_ts(state: &TableState, entries: &[CommitEntry]) -> Option<i64> {
         for entry in entries {
             for action in &entry.actions {
                 if let Action::MetaData(m) = action {
-                    if created_time.is_none() {
-                        created_time = m.created_time;
-                    }
-
-                    if let Ok(schema) = StructType::from_schema_string(&m.schema_string) {
-                        let current_fields: Vec<String> =
-                            schema.fields.iter().map(|f| f.name.clone()).collect();
-
-                        if !prev_fields.is_empty() && current_fields != prev_fields {
-                            schema_changes += 1;
-                        }
-
-                        prev_fields = current_fields;
-                        latest_column_count = schema.fields.len();
+                    if m.created_time.is_some() {
+                        return m.created_time;
                     }
                 }
             }
         }
-
-        (latest_column_count, schema_changes, created_time)
+        state.metadata.as_ref().and_then(|m| m.created_time)
     }
 
-    fn find_last_modified_ts(entries: &[CommitEntry]) -> Option<i64> {
-        entries.iter().rev().find_map(|e| {
-            e.actions.iter().find_map(|a| {
-                if let Action::CommitInfo(ci) = a {
-                    Some(ci.timestamp)
-                } else {
-                    None
-                }
+    fn find_last_modified_ts(state: &TableState, entries: &[CommitEntry]) -> Option<i64> {
+        if let Some(ts) = entries.iter().rev().find_map(|e| {
+            e.actions.iter().find_map(|a| match a {
+                Action::CommitInfo(ci) if ci.timestamp > 0 => Some(ci.timestamp),
+                _ => None,
             })
-        })
-    }
-
-    fn find_protocol_version(entries: &[CommitEntry]) -> (i32, i32) {
-        for entry in entries.iter().rev() {
-            for action in &entry.actions {
-                if let Action::Protocol(p) = action {
-                    return (p.min_reader_version, p.min_writer_version);
-                }
-            }
+        }) {
+            return Some(ts);
         }
-        (1, 2) // Delta Lake defaults
+        state
+            .active_files
+            .values()
+            .map(|a| a.modification_time)
+            .filter(|&t| t > 0)
+            .max()
     }
 
     fn empty_stats() -> TableStats {
@@ -263,22 +245,17 @@ impl HealthAnalyzer {
             last_modified_timestamp: None,
             min_reader_version: 1,
             min_writer_version: 2,
-            partition_columns: vec![],
+            reader_features: Vec::new(),
+            writer_features: Vec::new(),
+            partition_columns: Vec::new(),
             partition_count: 0,
             empty_partition_count: 0,
             schema_column_count: 0,
             schema_change_count: 0,
-            health: TableHealth {
-                total_files: 0,
-                total_size: 0,
-                avg_file_size: 0,
-                min_file_size: 0,
-                max_file_size: 0,
-                small_file_count: 0,
-                small_file_pct: 0.0,
-                skew_score: 0.0,
-            },
+            health: TableHealth::default(),
+            tombstones: Default::default(),
             maintenance: MaintenanceInfo::default(),
+            warnings: Vec::new(),
         }
     }
 }
@@ -286,6 +263,8 @@ impl HealthAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::model::action::{AddAction, CommitInfoAction, RemoveAction};
+    use std::collections::HashMap;
 
     #[test]
     fn test_skew_score_uniform() {
@@ -313,5 +292,180 @@ mod tests {
     fn test_skew_score_single_element() {
         let score = HealthAnalyzer::compute_skew_score(&[42]);
         assert_eq!(score, 0.0);
+    }
+
+    #[test]
+    fn test_vacuum_requires_completed_end_and_preserves_zorder() {
+        let mut failed_params = HashMap::new();
+        failed_params.insert("status".to_string(), serde_json::json!("FAILED"));
+        let mut ok_params = HashMap::new();
+        ok_params.insert("status".to_string(), serde_json::json!("COMPLETED"));
+        let mut zorder_params = HashMap::new();
+        zorder_params.insert("zOrderBy".to_string(), serde_json::json!("[\"user_id\"]"));
+        let mut empty_zorder_params = HashMap::new();
+        empty_zorder_params.insert("zOrderBy".to_string(), serde_json::json!("[]"));
+
+        let entries = vec![
+            CommitEntry {
+                version: 1,
+                path: "1.json".to_string(),
+                actions: vec![Action::CommitInfo(CommitInfoAction {
+                    timestamp: 1000,
+                    operation: "VACUUM START".to_string(),
+                    operation_parameters: HashMap::new(),
+                    notebook_info: None,
+                    job: None,
+                    cluster_id: None,
+                    user_id: None,
+                    user_name: None,
+                    operation_metrics: None,
+                    engine_info: None,
+                    is_blind_append: None,
+                    txn_id: None,
+                })],
+            },
+            CommitEntry {
+                version: 2,
+                path: "2.json".to_string(),
+                actions: vec![Action::CommitInfo(CommitInfoAction {
+                    timestamp: 2000,
+                    operation: "VACUUM END".to_string(),
+                    operation_parameters: failed_params,
+                    notebook_info: None,
+                    job: None,
+                    cluster_id: None,
+                    user_id: None,
+                    user_name: None,
+                    operation_metrics: None,
+                    engine_info: None,
+                    is_blind_append: None,
+                    txn_id: None,
+                })],
+            },
+            CommitEntry {
+                version: 3,
+                path: "3.json".to_string(),
+                actions: vec![Action::CommitInfo(CommitInfoAction {
+                    timestamp: 3000,
+                    operation: "OPTIMIZE".to_string(),
+                    operation_parameters: zorder_params,
+                    notebook_info: None,
+                    job: None,
+                    cluster_id: None,
+                    user_id: None,
+                    user_name: None,
+                    operation_metrics: None,
+                    engine_info: None,
+                    is_blind_append: None,
+                    txn_id: None,
+                })],
+            },
+            CommitEntry {
+                version: 4,
+                path: "4.json".to_string(),
+                actions: vec![Action::CommitInfo(CommitInfoAction {
+                    timestamp: 4000,
+                    operation: "OPTIMIZE".to_string(),
+                    operation_parameters: empty_zorder_params,
+                    notebook_info: None,
+                    job: None,
+                    cluster_id: None,
+                    user_id: None,
+                    user_name: None,
+                    operation_metrics: None,
+                    engine_info: None,
+                    is_blind_append: None,
+                    txn_id: None,
+                })],
+            },
+            CommitEntry {
+                version: 10,
+                path: "10.json".to_string(),
+                actions: vec![Action::CommitInfo(CommitInfoAction {
+                    timestamp: 5000,
+                    operation: "VACUUM END".to_string(),
+                    operation_parameters: ok_params,
+                    notebook_info: None,
+                    job: None,
+                    cluster_id: None,
+                    user_id: None,
+                    user_name: None,
+                    operation_metrics: None,
+                    engine_info: None,
+                    is_blind_append: None,
+                    txn_id: None,
+                })],
+            },
+        ];
+
+        let stats = HealthAnalyzer::analyze(&entries);
+        // No fabricated v10 checkpoint when no checkpoint actually exists!
+        assert_eq!(stats.maintenance.last_checkpoint_version, None);
+        assert_eq!(stats.maintenance.last_vacuum_version, Some(10));
+        assert_eq!(stats.maintenance.last_optimize_version, Some(4));
+        assert_eq!(stats.maintenance.z_order_columns, vec!["user_id"]);
+    }
+
+    #[test]
+    fn test_single_small_file_does_not_trigger_small_file_issue_and_empty_partitions_counted() {
+        let mut pv1 = HashMap::new();
+        pv1.insert("dt".to_string(), Some("2026-01-01".to_string()));
+        let mut pv2 = HashMap::new();
+        pv2.insert("dt".to_string(), Some("2026-01-02".to_string()));
+
+        let entries = vec![
+            CommitEntry {
+                version: 0,
+                path: "0.json".to_string(),
+                actions: vec![
+                    Action::Add(AddAction {
+                        path: "dt=2026-01-01/a.parquet".to_string(),
+                        size: 1024,
+                        modification_time: 1000,
+                        data_change: true,
+                        partition_values: pv1,
+                        stats: None,
+                        tags: None,
+                        deletion_vector: None,
+                    }),
+                    Action::Add(AddAction {
+                        path: "dt=2026-01-02/b.parquet".to_string(),
+                        size: 2048,
+                        modification_time: 1000,
+                        data_change: true,
+                        partition_values: pv2,
+                        stats: None,
+                        tags: None,
+                        deletion_vector: None,
+                    }),
+                ],
+            },
+            CommitEntry {
+                version: 1,
+                path: "1.json".to_string(),
+                actions: vec![Action::Remove(RemoveAction {
+                    path: "dt=2026-01-01/a.parquet".to_string(),
+                    deletion_timestamp: Some(2000),
+                    data_change: true,
+                    extended_file_metadata: None,
+                    size: None,
+                    partition_values: None,
+                    tags: None,
+                    deletion_vector: None,
+                })],
+            },
+        ];
+
+        let stats = HealthAnalyzer::analyze(&entries);
+        assert_eq!(stats.health.total_files, 1);
+        assert_eq!(stats.partition_count, 1);
+        assert_eq!(stats.empty_partition_count, 1);
+        assert_eq!(stats.tombstones.active_tombstones, 1);
+        assert_eq!(stats.tombstones.reclaimable_bytes, 1024);
+        assert!(
+            stats.health_issues().is_empty(),
+            "Single-file table should not trigger small-file issue: {:?}",
+            stats.health_issues()
+        );
     }
 }

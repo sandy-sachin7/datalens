@@ -29,15 +29,39 @@ impl DeltalensConfig {
         Ok(())
     }
 
+    /// Resolve cross-platform config path respecting DELTALENS_CONFIG_DIR, XDG_CONFIG_HOME,
+    /// HOME, APPDATA, and USERPROFILE.
     pub fn path() -> PathBuf {
         if let Ok(dir) = std::env::var("DELTALENS_CONFIG_DIR") {
-            return PathBuf::from(dir).join("config.json");
+            if !dir.is_empty() {
+                return PathBuf::from(dir).join("config.json");
+            }
+        }
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            if !xdg.is_empty() {
+                return PathBuf::from(xdg).join("deltalens").join("config.json");
+            }
         }
         if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home)
-                .join(".config")
-                .join("deltalens")
-                .join("config.json");
+            if !home.is_empty() {
+                return PathBuf::from(home)
+                    .join(".config")
+                    .join("deltalens")
+                    .join("config.json");
+            }
+        }
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            if !appdata.is_empty() {
+                return PathBuf::from(appdata).join("deltalens").join("config.json");
+            }
+        }
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            if !profile.is_empty() {
+                return PathBuf::from(profile)
+                    .join(".config")
+                    .join("deltalens")
+                    .join("config.json");
+            }
         }
         PathBuf::from(".deltalens").join("config.json")
     }

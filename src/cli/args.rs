@@ -2,7 +2,10 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "deltalens")]
-#[command(about = "Zero-dependency CLI for Delta Lake observability", long_about = None)]
+#[command(
+    about = "Standalone CLI to inspect Delta Lake tables without Spark, JVM, or Python",
+    long_about = None
+)]
 #[command(version)]
 pub struct Cli {
     #[command(subcommand)]
@@ -20,7 +23,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_header: bool,
 
-    /// Show debug info
+    /// Show debug info and parse warnings on stderr
     #[arg(short, long, global = true)]
     pub verbose: bool,
 }
@@ -29,16 +32,20 @@ pub struct Cli {
 pub enum Commands {
     /// Table health report
     Inspect {
-        /// Path to the Delta table (local path or s3:// URI)
+        /// Path to the Delta table (local path or cloud URI: s3://, gs://, az://, abfss://)
         path: String,
 
         /// Inspect at specific version (default: latest)
         #[arg(long)]
         version: Option<u64>,
+
+        /// Exit with status code 2 if any table health issues are detected (CI gate)
+        #[arg(long)]
+        fail_on_issues: bool,
     },
     /// Version diff
     Diff {
-        /// Path to the Delta table (local path or s3:// URI)
+        /// Path to the Delta table (local path or cloud URI)
         path: String,
 
         /// Starting version
@@ -50,20 +57,24 @@ pub enum Commands {
         v2: u64,
 
         /// Show only schema changes
-        #[arg(long)]
+        #[arg(long, conflicts_with = "files_only")]
         schema_only: bool,
 
         /// Show only file-level changes
-        #[arg(long)]
+        #[arg(long, conflicts_with = "schema_only")]
         files_only: bool,
+
+        /// Exit with status code 2 if breaking schema changes are detected (CI gate)
+        #[arg(long)]
+        fail_on_breaking: bool,
     },
 
     /// Operation lineage
     Lineage {
-        /// Path to the Delta table (local path or s3:// URI)
+        /// Path to the Delta table (local path or cloud URI)
         path: String,
 
-        /// Show last N commits (default: 20)
+        /// Show last N matching commits (default: 20)
         #[arg(long)]
         last: Option<usize>,
 
@@ -71,7 +82,7 @@ pub enum Commands {
         #[arg(long)]
         since: Option<String>,
 
-        /// Filter by operation type(s)
+        /// Filter by operation type(s) (comma-separated)
         #[arg(long)]
         op: Option<String>,
 
@@ -82,14 +93,14 @@ pub enum Commands {
 
     /// Filtered audit trail
     Audit {
-        /// Path to the Delta table (local path or s3:// URI)
+        /// Path to the Delta table (local path or cloud URI)
         path: String,
 
         /// Start date filter (YYYY-MM-DD)
         #[arg(long)]
         since: Option<String>,
 
-        /// End date filter (YYYY-MM-DD)
+        /// End date filter (YYYY-MM-DD, inclusive through 23:59:59.999 UTC)
         #[arg(long)]
         until: Option<String>,
 
@@ -97,22 +108,22 @@ pub enum Commands {
         #[arg(long)]
         op: Option<String>,
 
-        /// Filter by user
+        /// Filter by user or writer name
         #[arg(long)]
         user: Option<String>,
     },
 
     /// Schema evolution history
     Schema {
-        /// Path to the Delta table (local path or s3:// URI)
+        /// Path to the Delta table (local path or cloud URI)
         path: String,
 
         /// Show full evolution history (default: current only)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "at")]
         history: bool,
 
         /// Show schema at specific version
-        #[arg(long)]
+        #[arg(long, conflicts_with = "history")]
         at: Option<u64>,
     },
 

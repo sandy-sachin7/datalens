@@ -60,18 +60,47 @@ impl MetricsRecorder {
         }
     }
 
-    fn metrics_file() -> Option<PathBuf> {
+    pub fn metrics_file() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var("DELTALENS_DATA_DIR") {
-            return Some(PathBuf::from(dir).join("metrics.jsonl"));
+            if !dir.is_empty() {
+                return Some(PathBuf::from(dir).join("metrics.jsonl"));
+            }
+        }
+        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+            if !xdg.is_empty() {
+                return Some(PathBuf::from(xdg).join("deltalens").join("metrics.jsonl"));
+            }
         }
         if let Ok(home) = std::env::var("HOME") {
-            return Some(
-                PathBuf::from(home)
-                    .join(".local")
-                    .join("share")
-                    .join("deltalens")
-                    .join("metrics.jsonl"),
-            );
+            if !home.is_empty() {
+                return Some(
+                    PathBuf::from(home)
+                        .join(".local")
+                        .join("share")
+                        .join("deltalens")
+                        .join("metrics.jsonl"),
+                );
+            }
+        }
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            if !local_app_data.is_empty() {
+                return Some(
+                    PathBuf::from(local_app_data)
+                        .join("deltalens")
+                        .join("metrics.jsonl"),
+                );
+            }
+        }
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            if !profile.is_empty() {
+                return Some(
+                    PathBuf::from(profile)
+                        .join(".local")
+                        .join("share")
+                        .join("deltalens")
+                        .join("metrics.jsonl"),
+                );
+            }
         }
         None
     }
@@ -96,20 +125,28 @@ impl MetricsRecorder {
 
     pub fn summary() -> MetricsSummary {
         let all = Self::read_all();
+        Self::summary_from(&all)
+    }
+
+    pub fn summary_from(all: &[CommandMetrics]) -> MetricsSummary {
         let total_cmds = all.len();
-        let total_ms: f64 = all.iter().map(|m| m.duration_ms).sum();
+        let total_ms: f64 = all
+            .iter()
+            .map(|m| m.duration_ms)
+            .filter(|d| d.is_finite())
+            .sum();
         let avg_ms = if total_cmds > 0 {
             total_ms / total_cmds as f64
         } else {
             0.0
         };
-        let p50 = percentile(&all, 0.50);
-        let p95 = percentile(&all, 0.95);
-        let p99 = percentile(&all, 0.99);
+        let p50 = percentile(all, 0.50);
+        let p95 = percentile(all, 0.95);
+        let p99 = percentile(all, 0.99);
 
         let mut cmd_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
-        for m in &all {
+        for m in all {
             *cmd_counts.entry(m.command.clone()).or_insert(0) += 1;
         }
 
@@ -140,9 +177,57 @@ fn percentile(data: &[CommandMetrics], pct: f64) -> f64 {
     if data.is_empty() {
         return 0.0;
     }
-    let mut sorted: Vec<f64> = data.iter().map(|m| m.duration_ms).collect();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let idx = ((sorted.len() as f64) * pct).ceil() as usize - 1;
-    let idx = idx.clamp(0, sorted.len() - 1);
+    let mut sorted: Vec<f64> = data
+        .iter()
+        .map(|m| m.duration_ms)
+        .filter(|d| d.is_finite())
+        .collect();
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    sorted.sort_by(f64::total_cmp);
+    let rank = ((sorted.len() as f64) * pct).ceil().max(0.0) as usize;
+    let idx = rank.saturating_sub(1).min(sorted.len() - 1);
     sorted[idx]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_percentile_handles_nan_and_zero_pct() {
+        let entries = vec![
+            CommandMetrics {
+                timestamp: 1,
+                command: "inspect".to_string(),
+                duration_ms: f64::NAN,
+                num_commits: 1,
+                num_actions: 1,
+                table_version: "v0".to_string(),
+                version: "test".to_string(),
+            },
+            CommandMetrics {
+                timestamp: 2,
+                command: "inspect".to_string(),
+                duration_ms: 10.0,
+                num_commits: 1,
+                num_actions: 1,
+                table_version: "v1".to_string(),
+                version: "test".to_string(),
+            },
+            CommandMetrics {
+                timestamp: 3,
+                command: "inspect".to_string(),
+                duration_ms: 30.0,
+                num_commits: 1,
+                num_actions: 1,
+                table_version: "v2".to_string(),
+                version: "test".to_string(),
+            },
+        ];
+        assert_eq!(percentile(&entries, 0.0), 10.0);
+        assert_eq!(percentile(&entries, 0.5), 10.0);
+        assert_eq!(percentile(&entries, 0.99), 30.0);
+    }
 }

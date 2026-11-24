@@ -2,13 +2,13 @@
 name = "deltalens"
 version = "1.1.0"
 edition = "2021"
-description = "Zero-dependency CLI for Delta Lake observability"
+description = "Standalone CLI to inspect Delta Lake tables without Spark, JVM, or Python"
 license = "MIT"
 repository = "https://github.com/sandy-sachin7/datalens"
-homepage = "https://github.com/sandy-sachin7/datalens"
 readme = "README.md"
 keywords = ["delta-lake", "databricks", "data-engineering", "observability", "cli"]
 categories = ["command-line-utilities", "development-tools"]
+include = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
 
 [lib]
 name = "deltalens"
@@ -17,6 +17,13 @@ path = "src/lib.rs"
 [[bin]]
 name = "deltalens"
 path = "src/main.rs"
+
+[features]
+default = ["aws", "gcp", "azure"]
+cloud = ["dep:object_store", "dep:tokio", "dep:futures"]
+aws = ["cloud", "object_store/aws"]
+gcp = ["cloud", "object_store/gcp"]
+azure = ["cloud", "object_store/azure"]
 
 [dependencies]
 # CLI
@@ -30,7 +37,7 @@ serde_json = "1"
 rayon = "1"
 
 # Terminal rendering
-comfy-table = "=7.0.1"
+comfy-table = "7.0.1"
 colored = "2"
 
 # Time handling
@@ -38,19 +45,20 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Error handling
 thiserror = "1"
-anyhow = "1"
-
-# File system
-walkdir = "2"
-glob = "0.3"
 
 # Human readable sizes
 bytesize = "1"
 
-# Object storage support (S3, GCS, Azure, local)
-object_store = { version = "0.10", default-features = false, features = ["aws"] }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
-futures = "0.3"
+# Parquet checkpoint reading (classic, multi-part, V2 & sidecars)
+bytes = "1"
+arrow-array = { version = "53", default-features = false }
+arrow-schema = { version = "53", default-features = false }
+parquet = { version = "53", default-features = false, features = ["arrow", "snap", "zstd", "flate2", "lz4"] }
+
+# Object storage support (S3, GCS, Azure) — feature-gated
+object_store = { version = "0.11", default-features = false, optional = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread"], optional = true }
+futures = { version = "0.3", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

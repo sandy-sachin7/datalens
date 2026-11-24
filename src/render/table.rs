@@ -1,253 +1,439 @@
+use crate::core::analyzer::diff::VersionDiff;
+use crate::core::model::lineage::{LineageEntry, OperationType};
+use crate::core::model::schema::{SchemaChange, SchemaSnapshot};
 use crate::core::model::stats::TableStats;
 use bytesize::ByteSize;
 use chrono::{TimeZone, Utc};
+use colored::Colorize;
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
-use comfy_table::{Cell, Color, Table};
+use comfy_table::{Cell, Color, ContentArrangement, Table};
 use std::cmp::Ordering;
+use std::io::{self, IsTerminal, Write};
+
+const NONE_DISPLAY: &str = "(none)";
+
+/// Centralized, panic-free UTC timestamp formatter.
+pub fn format_timestamp_ms(ts: i64, fmt: &str) -> String {
+    match Utc.timestamp_millis_opt(ts).single() {
+        Some(dt) => dt.format(fmt).to_string(),
+        None => format!("invalid timestamp ({ts})"),
+    }
+}
+
+/// Panic-free non-negative byte formatter.
+pub fn format_bytes(bytes: i64) -> String {
+    match u64::try_from(bytes) {
+        Ok(b) => ByteSize::b(b).to_string(),
+        Err(_) => format!("-{}", ByteSize::b(bytes.unsigned_abs())),
+    }
+}
+
+/// Panic-free signed byte delta formatter (safe even for `i64::MIN`).
+pub fn format_signed_bytes(delta: i64) -> String {
+    if delta >= 0 {
+        format!("+{}", ByteSize::b(delta.unsigned_abs()))
+    } else {
+        format!("-{}", ByteSize::b(delta.unsigned_abs()))
+    }
+}
+
+fn format_list(items: &[String]) -> String {
+    if items.is_empty() {
+        NONE_DISPLAY.to_string()
+    } else {
+        items.join(", ")
+    }
+}
+
+fn format_rows(rows: i64) -> String {
+    let abs_r = rows.unsigned_abs();
+    let formatted_r = if abs_r >= 1_000_000 {
+        format!("{:.1}M", rows as f64 / 1_000_000.0)
+    } else if abs_r >= 1_000 {
+        format!("{:.1}K", rows as f64 / 1_000.0)
+    } else {
+        rows.to_string()
+    };
+    match rows.cmp(&0) {
+        Ordering::Greater => format!("+{formatted_r} rows"),
+        Ordering::Less => format!("{formatted_r} rows"),
+        Ordering::Equal => "±0 rows".to_string(),
+    }
+}
 
 pub struct TableRenderer {
     plain: bool,
+    no_header: bool,
+    use_color: bool,
 }
 
 impl TableRenderer {
-    pub fn new(plain: bool) -> Self {
-        Self { plain }
+    pub fn new(plain: bool, no_header: bool) -> Self {
+        let use_color =
+            !plain && std::env::var_os("NO_COLOR").is_none() && io::stdout().is_terminal();
+        Self {
+            plain,
+            no_header,
+            use_color,
+        }
     }
 
-    pub fn render_inspect(&self, path: &str, stats: &TableStats) {
+    /// Explicit constructor for deterministic unit testing.
+    pub fn with_options(plain: bool, no_header: bool, use_color: bool) -> Self {
+        Self {
+            plain,
+            no_header,
+            use_color: !plain && use_color,
+        }
+    }
+
+    fn make_table(&self) -> Table {
         let mut table = Table::new();
+        table.set_content_arrangement(ContentArrangement::Dynamic);
         if !self.plain {
             table
                 .load_preset(UTF8_FULL)
                 .apply_modifier(UTF8_ROUND_CORNERS);
         }
+        table
+    }
 
-        table.set_header(vec![
-            Cell::new("deltalens · Table Health Report").fg(if self.plain {
-                Color::Reset
-            } else {
-                Color::Cyan
-            }),
-            Cell::new(path.to_string()).fg(if self.plain {
-                Color::Reset
-            } else {
-                Color::Cyan
-            }),
+    /// Create a cell with color ONLY when `self.use_color` is true (zero ANSI escapes in plain mode).
+    fn cell(&self, text: impl Into<String>, color: Option<Color>) -> Cell {
+        let cell = Cell::new(text.into());
+        if self.use_color {
+            if let Some(c) = color {
+                return cell.fg(c);
+            }
+        }
+        cell
+    }
+
+    fn paint_cyan_bold(&self, text: &str) -> String {
+        if self.use_color {
+            text.cyan().bold().to_string()
+        } else {
+            text.to_string()
+        }
+    }
+
+    fn paint_cyan(&self, text: &str) -> String {
+        if self.use_color {
+            text.cyan().to_string()
+        } else {
+            text.to_string()
+        }
+    }
+
+    fn paint_gray(&self, text: &str) -> String {
+        if self.use_color {
+            text.truecolor(128, 128, 128).to_string()
+        } else {
+            text.to_string()
+        }
+    }
+
+    fn paint_green(&self, text: &str) -> String {
+        if self.use_color {
+            text.green().to_string()
+        } else {
+            text.to_string()
+        }
+    }
+
+    fn paint_red(&self, text: &str) -> String {
+        if self.use_color {
+            text.red().to_string()
+        } else {
+            text.to_string()
+        }
+    }
+
+    fn paint_yellow(&self, text: &str) -> String {
+        if self.use_color {
+            text.yellow().to_string()
+        } else {
+            text.to_string()
+        }
+    }
+
+    fn paint_op(&self, op: &OperationType, padded: &str) -> String {
+        if !self.use_color {
+            return padded.to_string();
+        }
+        match op {
+            OperationType::Write => padded.green().to_string(),
+            OperationType::Merge => padded.blue().to_string(),
+            OperationType::Delete => padded.red().to_string(),
+            OperationType::Update => padded.yellow().to_string(),
+            OperationType::Optimize => padded.magenta().to_string(),
+            _ => padded.to_string(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // inspect
+    // -----------------------------------------------------------------------
+
+    pub fn render_inspect(&self, path: &str, stats: &TableStats) -> io::Result<()> {
+        let mut stdout = io::stdout().lock();
+        self.render_inspect_to(&mut stdout, path, stats)
+    }
+
+    pub fn render_inspect_to<W: Write>(
+        &self,
+        w: &mut W,
+        path: &str,
+        stats: &TableStats,
+    ) -> io::Result<()> {
+        let mut table = self.make_table();
+
+        if !self.no_header {
+            table.set_header(vec![
+                self.cell("deltalens · Table Health Report", Some(Color::Cyan)),
+                self.cell(path, Some(Color::Cyan)),
+            ]);
+        }
+
+        table.add_row(vec![
+            "Current Version".to_string(),
+            format!("v{:03}", stats.current_version),
         ]);
 
-        table.add_row(vec!["Current Version", &stats.current_version.to_string()]);
-
         if let Some(created) = stats.created_timestamp {
-            let dt = Utc.timestamp_millis_opt(created).unwrap();
             table.add_row(vec![
-                "Created",
-                &dt.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+                "Created".to_string(),
+                format_timestamp_ms(created, "%Y-%m-%d %H:%M:%S UTC"),
             ]);
         }
         if let Some(modified) = stats.last_modified_timestamp {
-            let dt = Utc.timestamp_millis_opt(modified).unwrap();
             table.add_row(vec![
-                "Last Modified",
-                &dt.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+                "Last Modified".to_string(),
+                format_timestamp_ms(modified, "%Y-%m-%d %H:%M:%S UTC"),
             ]);
         }
 
-        table.add_row(vec![
-            "Protocol",
-            &format!(
-                "reader={}, writer={}",
-                stats.min_reader_version, stats.min_writer_version
-            ),
-        ]);
+        let mut proto = format!(
+            "reader={}, writer={}",
+            stats.min_reader_version, stats.min_writer_version
+        );
+        if !stats.reader_features.is_empty() || !stats.writer_features.is_empty() {
+            proto.push_str(&format!(
+                " (r:[{}], w:[{}])",
+                format_list(&stats.reader_features),
+                format_list(&stats.writer_features)
+            ));
+        }
+        table.add_row(vec!["Protocol".to_string(), proto]);
 
         table.add_row(vec![
-            Cell::new("DATA FILES").fg(if self.plain {
-                Color::Reset
-            } else {
-                Color::Yellow
-            }),
-            Cell::new(""),
-        ]);
-        table.add_row(vec!["Total Files", &stats.health.total_files.to_string()]);
-        table.add_row(vec![
-            "Total Size",
-            &ByteSize::b(stats.health.total_size as u64).to_string(),
+            self.cell("DATA FILES", Some(Color::Yellow)),
+            self.cell("", None),
         ]);
         table.add_row(vec![
-            "Avg File Size",
-            &ByteSize::b(stats.health.avg_file_size as u64).to_string(),
+            "Total Files".to_string(),
+            stats.health.total_files.to_string(),
+        ]);
+        table.add_row(vec![
+            "Total Size".to_string(),
+            format_bytes(stats.health.total_size),
+        ]);
+        table.add_row(vec![
+            "Avg File Size".to_string(),
+            format_bytes(stats.health.avg_file_size),
         ]);
 
         let skew_warn = stats.health.skew_score > 0.5;
-        let mut min_cell = Cell::new(ByteSize::b(stats.health.min_file_size as u64).to_string());
-        let mut max_cell = Cell::new(ByteSize::b(stats.health.max_file_size as u64).to_string());
+        let warn_color = if skew_warn { Some(Color::Red) } else { None };
+        table.add_row(vec![
+            self.cell("Min File Size", None),
+            self.cell(format_bytes(stats.health.min_file_size), warn_color),
+        ]);
+        table.add_row(vec![
+            self.cell("Max File Size", None),
+            self.cell(format_bytes(stats.health.max_file_size), warn_color),
+        ]);
 
-        if skew_warn && !self.plain {
-            min_cell = min_cell.fg(Color::Red);
-            max_cell = max_cell.fg(Color::Red);
-        }
-        table.add_row(vec![Cell::new("Min File Size"), min_cell]);
-        table.add_row(vec![Cell::new("Max File Size"), max_cell]);
-
-        let small_warn = stats.health.small_file_pct > 20.0;
+        let small_warn = stats.health.total_files > 1 && stats.health.small_file_pct > 20.0;
         let small_val = format!(
             "{} ({:.1}%)",
             stats.health.small_file_count, stats.health.small_file_pct
         );
-        let mut small_cell = Cell::new(small_val);
-        if small_warn && !self.plain {
-            small_cell = small_cell.fg(Color::Red);
+        table.add_row(vec![
+            self.cell("Small Files (<32MB)", None),
+            self.cell(small_val, if small_warn { Some(Color::Red) } else { None }),
+        ]);
+
+        table.add_row(vec![
+            self.cell("Skew Score", None),
+            self.cell(format!("{:.2} / 1.0", stats.health.skew_score), warn_color),
+        ]);
+
+        if stats.health.deletion_vector_files > 0 {
+            table.add_row(vec![
+                "Deletion Vectors".to_string(),
+                format!(
+                    "{} files ({} deleted rows)",
+                    stats.health.deletion_vector_files, stats.health.deleted_rows_in_dvs
+                ),
+            ]);
         }
-        table.add_row(vec![Cell::new("Small Files (<32MB)"), small_cell]);
-
-        let skew_val = format!("{:.2} / 1.0", stats.health.skew_score);
-        let mut skew_cell = Cell::new(skew_val);
-        if skew_warn && !self.plain {
-            skew_cell = skew_cell.fg(Color::Red);
-        }
-        table.add_row(vec![Cell::new("Skew Score"), skew_cell]);
 
         table.add_row(vec![
-            Cell::new("PARTITIONS").fg(if self.plain {
-                Color::Reset
-            } else {
-                Color::Yellow
-            }),
-            Cell::new(""),
+            self.cell("PARTITIONS", Some(Color::Yellow)),
+            self.cell("", None),
         ]);
         table.add_row(vec![
-            "Partition Columns",
-            &stats.partition_columns.join(", "),
+            "Partition Columns".to_string(),
+            format_list(&stats.partition_columns),
         ]);
-        table.add_row(vec!["Partition Count", &stats.partition_count.to_string()]);
         table.add_row(vec![
-            "Empty Partitions",
-            &stats.empty_partition_count.to_string(),
+            "Partition Count".to_string(),
+            stats.partition_count.to_string(),
+        ]);
+        table.add_row(vec![
+            "Empty Partitions".to_string(),
+            stats.empty_partition_count.to_string(),
         ]);
 
         table.add_row(vec![
-            Cell::new("MAINTENANCE").fg(if self.plain {
-                Color::Reset
-            } else {
-                Color::Yellow
-            }),
-            Cell::new(""),
+            self.cell("MAINTENANCE", Some(Color::Yellow)),
+            self.cell("", None),
         ]);
 
         let last_vac = match stats.maintenance.last_vacuum_version {
-            Some(v) => format!(
-                "v{} ({} ts)",
-                v,
-                stats.maintenance.last_vacuum_timestamp.unwrap_or(0)
-            ),
+            Some(v) => match stats.maintenance.last_vacuum_timestamp {
+                Some(ts) if ts > 0 => format!(
+                    "v{:03} ({})",
+                    v,
+                    format_timestamp_ms(ts, "%Y-%m-%d %H:%M:%S UTC")
+                ),
+                _ => format!("v{:03}", v),
+            },
             None => "Never".to_string(),
         };
-        table.add_row(vec!["Last VACUUM", &last_vac]);
+        table.add_row(vec!["Last VACUUM".to_string(), last_vac]);
 
         let last_opt = match stats.maintenance.last_optimize_version {
-            Some(v) => format!(
-                "v{} ({} ts)",
-                v,
-                stats.maintenance.last_optimize_timestamp.unwrap_or(0)
-            ),
+            Some(v) => match stats.maintenance.last_optimize_timestamp {
+                Some(ts) if ts > 0 => format!(
+                    "v{:03} ({})",
+                    v,
+                    format_timestamp_ms(ts, "%Y-%m-%d %H:%M:%S UTC")
+                ),
+                _ => format!("v{:03}", v),
+            },
             None => "Never".to_string(),
         };
-        table.add_row(vec!["Last OPTIMIZE", &last_opt]);
+        table.add_row(vec!["Last OPTIMIZE".to_string(), last_opt]);
 
         let last_ckpt = match stats.maintenance.last_checkpoint_version {
-            Some(v) => format!("v{}", v),
-            None => "None found".to_string(),
+            Some(v) => format!("v{:03}", v),
+            None => NONE_DISPLAY.to_string(),
         };
-        table.add_row(vec!["Last CHECKPOINT", &last_ckpt]);
-        table.add_row(vec![
-            "Z-Order Columns",
-            &stats.maintenance.z_order_columns.join(", "),
-        ]);
+        table.add_row(vec!["Last CHECKPOINT".to_string(), last_ckpt]);
 
         table.add_row(vec![
-            Cell::new("SCHEMA").fg(if self.plain {
-                Color::Reset
-            } else {
-                Color::Yellow
-            }),
-            Cell::new(""),
+            "Z-Order Columns".to_string(),
+            format_list(&stats.maintenance.z_order_columns),
         ]);
-        table.add_row(vec!["Column Count", &stats.schema_column_count.to_string()]);
-        table.add_row(vec![
-            "Schema Changes",
-            &format!("{} (since inception)", stats.schema_change_count),
-        ]);
-
-        println!("{table}");
-
-        let mut issues = 0;
-        if skew_warn {
-            issues += 1;
-        }
-        if small_warn {
-            issues += 1;
-        }
-        if stats.maintenance.last_vacuum_version.is_none() && stats.current_version > 100 {
-            issues += 1;
-        }
-        if stats.maintenance.last_optimize_version.is_none() && stats.current_version > 100 {
-            issues += 1;
+        if !stats.maintenance.clustering_columns.is_empty() {
+            table.add_row(vec![
+                "Clustering Columns".to_string(),
+                format_list(&stats.maintenance.clustering_columns),
+            ]);
         }
 
-        if issues > 0 {
-            let mut msg = format!(
-                "{} {} detected. Use `inspect` output above to identify concerns.",
-                if !self.plain { "⚠ " } else { "" },
-                if issues == 1 { "issue" } else { "issues" }
+        let tomb_val = if stats.tombstones.active_tombstones == 0 {
+            "0".to_string()
+        } else {
+            let mut s = format!(
+                "{} ({} reclaimable)",
+                stats.tombstones.active_tombstones,
+                format_bytes(stats.tombstones.reclaimable_bytes)
             );
-            if !self.plain {
-                use colored::Colorize;
-                msg = msg.yellow().to_string();
+            if let Some(oldest) = stats.tombstones.oldest_tombstone_timestamp {
+                s.push_str(&format!(
+                    ", oldest {}",
+                    format_timestamp_ms(oldest, "%Y-%m-%d")
+                ));
             }
-            println!("\n{}", msg);
+            s
+        };
+        table.add_row(vec!["Active Tombstones".to_string(), tomb_val]);
+
+        table.add_row(vec![
+            self.cell("SCHEMA", Some(Color::Yellow)),
+            self.cell("", None),
+        ]);
+        table.add_row(vec![
+            "Column Count".to_string(),
+            stats.schema_column_count.to_string(),
+        ]);
+        table.add_row(vec![
+            "Schema Changes".to_string(),
+            format!("{} (in analyzed log)", stats.schema_change_count),
+        ]);
+
+        writeln!(w, "{table}")?;
+
+        let issues = stats.health_issues();
+        if !issues.is_empty() {
+            let prefix = if self.plain { "WARN: " } else { "⚠ " };
+            let noun = if issues.len() == 1 { "issue" } else { "issues" };
+            let summary = format!("{prefix}{} {noun} detected:", issues.len());
+            writeln!(w, "\n{}", self.paint_yellow(&summary))?;
+            for issue in &issues {
+                writeln!(w, "  - {issue}")?;
+            }
         }
+
+        Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // diff
+    // -----------------------------------------------------------------------
 
     pub fn render_diff(
         &self,
         path: &str,
-        diff: &crate::core::analyzer::diff::VersionDiff,
+        diff: &VersionDiff,
         schema_only: bool,
         files_only: bool,
-    ) {
-        let mut table = Table::new();
-        if !self.plain {
-            table
-                .load_preset(UTF8_FULL)
-                .apply_modifier(UTF8_ROUND_CORNERS);
-        }
+    ) -> io::Result<()> {
+        let mut stdout = io::stdout().lock();
+        self.render_diff_to(&mut stdout, path, diff, schema_only, files_only)
+    }
 
-        table.set_header(vec![
-            Cell::new(format!(
-                "deltalens · Version Diff  v{} → v{}",
-                diff.v1, diff.v2
-            ))
-            .fg(if self.plain {
-                Color::Reset
-            } else {
-                Color::Cyan
-            }),
-            Cell::new(path.to_string()).fg(if self.plain {
-                Color::Reset
-            } else {
-                Color::Cyan
-            }),
-        ]);
+    pub fn render_diff_to<W: Write>(
+        &self,
+        w: &mut W,
+        path: &str,
+        diff: &VersionDiff,
+        schema_only: bool,
+        files_only: bool,
+    ) -> io::Result<()> {
+        let mut table = self.make_table();
+
+        if !self.no_header {
+            table.set_header(vec![
+                self.cell(
+                    format!(
+                        "deltalens · Version Diff  v{:03} → v{:03}",
+                        diff.v1, diff.v2
+                    ),
+                    Some(Color::Cyan),
+                ),
+                self.cell(path, Some(Color::Cyan)),
+            ]);
+        }
 
         if !files_only {
             table.add_row(vec![
-                Cell::new("SCHEMA CHANGES").fg(if self.plain {
-                    Color::Reset
-                } else {
-                    Color::Yellow
-                }),
-                Cell::new(""),
+                self.cell("SCHEMA CHANGES", Some(Color::Yellow)),
+                self.cell("", None),
             ]);
 
             if diff.schema_changes.is_empty() {
@@ -255,27 +441,59 @@ impl TableRenderer {
             } else {
                 for change in &diff.schema_changes {
                     for col in &change.added_columns {
-                        let mut action_cell = Cell::new("+ added");
-                        if !self.plain {
-                            action_cell = action_cell.fg(Color::Green);
-                        }
-                        table.add_row(vec![action_cell, Cell::new(col)]);
+                        table.add_row(vec![
+                            self.cell("+ added", Some(Color::Green)),
+                            self.cell(col, None),
+                        ]);
                     }
                     for col in &change.removed_columns {
-                        let mut action_cell = Cell::new("- removed");
-                        if !self.plain {
-                            action_cell = action_cell.fg(Color::Red);
-                        }
-                        table.add_row(vec![action_cell, Cell::new(col)]);
-                    }
-                    for (name, old_t, new_t) in &change.modified_columns {
-                        let mut action_cell = Cell::new("~ modified");
-                        if !self.plain {
-                            action_cell = action_cell.fg(Color::Yellow);
-                        }
                         table.add_row(vec![
-                            action_cell,
-                            Cell::new(format!("{} ({} → {})", name, old_t, new_t)),
+                            self.cell("- removed [BREAKING]", Some(Color::Red)),
+                            self.cell(col, None),
+                        ]);
+                    }
+                    for ren in &change.renamed_columns {
+                        table.add_row(vec![
+                            self.cell("→ renamed [BREAKING]", Some(Color::Yellow)),
+                            self.cell(format!("{} → {}", ren.old_name, ren.new_name), None),
+                        ]);
+                    }
+                    for m in &change.modified_columns {
+                        let tag = if m.breaking {
+                            "~ modified [BREAKING]"
+                        } else {
+                            "~ widened"
+                        };
+                        let color = if m.breaking {
+                            Some(Color::Red)
+                        } else {
+                            Some(Color::Yellow)
+                        };
+                        table.add_row(vec![
+                            self.cell(tag, color),
+                            self.cell(
+                                format!("{} ({} → {})", m.name, m.old_type, m.new_type),
+                                None,
+                            ),
+                        ]);
+                    }
+                    for n in &change.nullability_changes {
+                        let tag = if n.breaking {
+                            "~ nullable [BREAKING]"
+                        } else {
+                            "~ nullable"
+                        };
+                        let color = if n.breaking {
+                            Some(Color::Red)
+                        } else {
+                            Some(Color::Yellow)
+                        };
+                        table.add_row(vec![
+                            self.cell(tag, color),
+                            self.cell(
+                                format!("{} ({} → {})", n.name, n.old_nullable, n.new_nullable),
+                                None,
+                            ),
                         ]);
                     }
                 }
@@ -284,46 +502,57 @@ impl TableRenderer {
 
         if !schema_only {
             table.add_row(vec![
-                Cell::new("DATA CHANGES").fg(if self.plain {
-                    Color::Reset
-                } else {
-                    Color::Yellow
-                }),
-                Cell::new(""),
+                self.cell("DATA CHANGES", Some(Color::Yellow)),
+                self.cell("", None),
             ]);
 
-            table.add_row(vec!["Files Added", &format!("+{}", diff.files_added)]);
-            table.add_row(vec!["Files Removed", &format!("-{}", diff.files_removed)]);
             table.add_row(vec![
-                "Net File Delta",
-                &format!("{:+}", diff.files_added - diff.files_removed),
+                "Files Added".to_string(),
+                format!("+{}", diff.files_added),
             ]);
             table.add_row(vec![
-                "Size Added",
-                &ByteSize::b(diff.bytes_added as u64).to_string(),
+                "Files Removed".to_string(),
+                format!("-{}", diff.files_removed),
             ]);
             table.add_row(vec![
-                "Size Removed",
-                &ByteSize::b(diff.bytes_removed as u64).to_string(),
+                "Net File Delta".to_string(),
+                format!("{:+}", diff.files_added - diff.files_removed),
+            ]);
+            table.add_row(vec![
+                "Size Added".to_string(),
+                format_bytes(diff.bytes_added),
+            ]);
+            table.add_row(vec![
+                "Size Removed".to_string(),
+                format_bytes(diff.bytes_removed),
+            ]);
+            table.add_row(vec![
+                "Net Size Delta".to_string(),
+                format_signed_bytes(diff.bytes_added - diff.bytes_removed),
             ]);
 
-            let net_bytes = diff.bytes_added - diff.bytes_removed;
-            let net_size_str = if net_bytes >= 0 {
-                format!("+{}", ByteSize::b(net_bytes as u64))
-            } else {
-                format!("-{}", ByteSize::b((-net_bytes) as u64))
-            };
-            table.add_row(vec!["Net Size Delta", &net_size_str]);
+            if diff.physical_files_added != diff.files_added
+                || diff.physical_files_removed != diff.files_removed
+            {
+                table.add_row(vec![
+                    "Physical Files (incl. OPTIMIZE)".to_string(),
+                    format!(
+                        "+{} / -{} ({} net)",
+                        diff.physical_files_added,
+                        diff.physical_files_removed,
+                        format_signed_bytes(
+                            diff.physical_bytes_added - diff.physical_bytes_removed
+                        )
+                    ),
+                ]);
+            }
 
             table.add_row(vec![
-                Cell::new(format!("OPERATIONS ({} commits)", diff.total_commits)).fg(
-                    if self.plain {
-                        Color::Reset
-                    } else {
-                        Color::Yellow
-                    },
+                self.cell(
+                    format!("OPERATIONS ({} commits)", diff.total_commits),
+                    Some(Color::Yellow),
                 ),
-                Cell::new(""),
+                self.cell("", None),
             ]);
 
             if diff.operations.is_empty() {
@@ -332,17 +561,13 @@ impl TableRenderer {
                 let mut ops: Vec<_> = diff.operations.iter().collect();
                 ops.sort_by_key(|(op, _)| *op);
                 for (op, count) in ops {
-                    table.add_row(vec![op, &count.to_string()]);
+                    table.add_row(vec![op.as_str(), &count.to_string()]);
                 }
             }
 
             table.add_row(vec![
-                Cell::new("PARTITION CHANGES").fg(if self.plain {
-                    Color::Reset
-                } else {
-                    Color::Yellow
-                }),
-                Cell::new(""),
+                self.cell("PARTITION CHANGES", Some(Color::Yellow)),
+                self.cell("", None),
             ]);
 
             let new_part_str = if diff.new_partitions.is_empty() {
@@ -363,310 +588,464 @@ impl TableRenderer {
                     diff.removed_partitions.join(", ")
                 )
             };
-            table.add_row(vec!["New Partitions", &new_part_str]);
-            table.add_row(vec!["Removed Partitions", &rem_part_str]);
+            table.add_row(vec!["New Partitions".to_string(), new_part_str]);
+            table.add_row(vec!["Removed Partitions".to_string(), rem_part_str]);
         }
 
-        println!("{table}");
+        writeln!(w, "{table}")
     }
 
-    pub fn render_lineage(
+    // -----------------------------------------------------------------------
+    // lineage
+    // -----------------------------------------------------------------------
+
+    pub fn render_lineage(&self, path: &str, entries: &[LineageEntry]) -> io::Result<()> {
+        let mut stdout = io::stdout().lock();
+        self.render_lineage_to(&mut stdout, path, entries)
+    }
+
+    pub fn render_lineage_to<W: Write>(
         &self,
-        _path: &str,
-        entries: &[crate::core::model::lineage::LineageEntry],
-    ) {
-        if entries.is_empty() {
-            println!("No lineage entries found.");
-            return;
-        }
-
-        for entry in entries {
-            let dt = Utc.timestamp_millis_opt(entry.timestamp).unwrap();
-            let dt_str = dt.format("%Y-%m-%d %H:%M").to_string();
-
-            let net_bytes = entry.bytes_added - entry.bytes_removed;
-            let size_str = if net_bytes >= 0 {
-                format!("+{}", ByteSize::b(net_bytes as u64))
-            } else {
-                format!("-{}", ByteSize::b((-net_bytes) as u64))
-            };
-
-            let rows_str = match entry.num_output_rows {
-                Some(r) => {
-                    let abs_r = r.abs();
-                    let formatted_r = if abs_r >= 1_000_000 {
-                        format!("{:.1}M", r as f64 / 1_000_000.0)
-                    } else if abs_r >= 1_000 {
-                        format!("{:.1}K", r as f64 / 1_000.0)
-                    } else {
-                        r.to_string()
-                    };
-                    match r.cmp(&0) {
-                        Ordering::Greater => format!("+{} rows", formatted_r),
-                        Ordering::Less => format!("{} rows", formatted_r),
-                        Ordering::Equal => "±0 rows".to_string(),
-                    }
-                }
-                None => "".to_string(),
-            };
-
-            if self.plain {
-                println!(
-                    "v{:<4}  {:<16}  {:<12}  {:<24}  {:<8}  {}",
-                    entry.version, dt_str, entry.operation_raw, entry.writer, size_str, rows_str
-                );
-            } else {
-                use colored::Colorize;
-                let version_styled = format!("v{}", entry.version).cyan();
-                let dt_styled = dt_str.truecolor(128, 128, 128); // gray
-
-                let op_styled = match entry.operation {
-                    crate::core::model::lineage::OperationType::Write => {
-                        entry.operation_raw.green()
-                    }
-                    crate::core::model::lineage::OperationType::Merge => entry.operation_raw.blue(),
-                    crate::core::model::lineage::OperationType::Delete => entry.operation_raw.red(),
-                    crate::core::model::lineage::OperationType::Update => {
-                        entry.operation_raw.yellow()
-                    }
-                    crate::core::model::lineage::OperationType::Optimize => {
-                        entry.operation_raw.magenta()
-                    }
-                    _ => entry.operation_raw.normal(),
-                };
-
-                let writer_styled = entry.writer.white();
-                let size_styled = if net_bytes >= 0 {
-                    size_str.green()
-                } else {
-                    size_str.red()
-                };
-                let rows_styled = if entry.num_output_rows.unwrap_or(0) >= 0 {
-                    rows_str.green()
-                } else {
-                    rows_str.red()
-                };
-
-                println!(
-                    "{:<14}  {:<25}  {:<22}  {:<32}  {:<18}  {}",
-                    version_styled, dt_styled, op_styled, writer_styled, size_styled, rows_styled
-                );
-            }
-        }
-    }
-
-    pub fn render_audit(&self, _path: &str, entries: &[crate::core::model::lineage::LineageEntry]) {
-        if entries.is_empty() {
-            println!("No audit operations found matching the criteria.");
-            return;
-        }
-
-        if !self.plain {
-            use colored::Colorize;
-            println!("{}", "Audit Trail".cyan().bold());
-        } else {
-            println!("Audit Trail");
-        }
-
-        for entry in entries {
-            let dt = Utc.timestamp_millis_opt(entry.timestamp).unwrap();
-            let dt_str = dt.format("%Y-%m-%d %H:%M").to_string();
-
-            let predicate_str = match &entry.predicate {
-                Some(p) => format!("predicate=\"{}\"", p),
-                None => "".to_string(),
-            };
-
-            let net_bytes = entry.bytes_added - entry.bytes_removed;
-            let size_str = if net_bytes >= 0 {
-                format!("+{}", ByteSize::b(net_bytes as u64))
-            } else {
-                format!("-{}", ByteSize::b((-net_bytes) as u64))
-            };
-
-            let rows_str = match entry.num_output_rows {
-                Some(r) => {
-                    let abs_r = r.abs();
-                    let formatted_r = if abs_r >= 1_000_000 {
-                        format!("{:.1}M", r as f64 / 1_000_000.0)
-                    } else if abs_r >= 1_000 {
-                        format!("{:.1}K", r as f64 / 1_000.0)
-                    } else {
-                        r.to_string()
-                    };
-                    match r.cmp(&0) {
-                        Ordering::Greater => format!("+{} rows", formatted_r),
-                        Ordering::Less => format!("{} rows", formatted_r),
-                        Ordering::Equal => "±0 rows".to_string(),
-                    }
-                }
-                None => size_str,
-            };
-
-            if self.plain {
-                println!(
-                    "{}  {:<10}  {:<12}  {:<35}  {}",
-                    dt_str, entry.operation_raw, entry.writer, predicate_str, rows_str
-                );
-            } else {
-                use colored::Colorize;
-                let dt_styled = dt_str.truecolor(128, 128, 128); // gray
-
-                let op_styled = match entry.operation {
-                    crate::core::model::lineage::OperationType::Merge => entry.operation_raw.blue(),
-                    crate::core::model::lineage::OperationType::Delete => entry.operation_raw.red(),
-                    crate::core::model::lineage::OperationType::Update => {
-                        entry.operation_raw.yellow()
-                    }
-                    _ => entry.operation_raw.normal(),
-                };
-
-                let writer_styled = entry.writer.white();
-                let pred_styled = predicate_str.truecolor(140, 180, 250); // soft blue
-                let rows_styled = if entry.num_output_rows.unwrap_or(0) >= 0 {
-                    rows_str.green()
-                } else {
-                    rows_str.red()
-                };
-
-                println!(
-                    "{}  {:<20}  {:<22}  {:<45}  {}",
-                    dt_styled, op_styled, writer_styled, pred_styled, rows_styled
-                );
-            }
-        }
-        println!("\n{} operations found.", entries.len());
-    }
-
-    pub fn render_schema_snapshot(
-        &self,
+        w: &mut W,
         path: &str,
-        snapshot: &crate::core::model::schema::SchemaSnapshot,
-    ) {
-        let mut table = Table::new();
-        if !self.plain {
-            table
-                .load_preset(UTF8_FULL)
-                .apply_modifier(UTF8_ROUND_CORNERS);
+        entries: &[LineageEntry],
+    ) -> io::Result<()> {
+        if entries.is_empty() {
+            writeln!(w, "No lineage entries found.")?;
+            return Ok(());
         }
 
-        table.set_header(vec![
-            Cell::new(format!("Schema at Version {}", snapshot.version)).fg(if self.plain {
-                Color::Reset
-            } else {
-                Color::Cyan
-            }),
-            Cell::new(path.to_string()).fg(if self.plain {
-                Color::Reset
-            } else {
-                Color::Cyan
-            }),
-        ]);
+        if !self.no_header {
+            writeln!(w, "{}", self.paint_cyan_bold(&format!("Lineage · {path}")))?;
+        }
 
-        table.add_row(vec![
-            Cell::new("Field Name").fg(if self.plain {
-                Color::Reset
+        for entry in entries {
+            let ver_pad = format!("{:<6}", format!("v{:03}", entry.version));
+            let dt_raw = match entry.timestamp {
+                Some(ts) => format_timestamp_ms(ts, "%Y-%m-%d %H:%M"),
+                None => "N/A".to_string(),
+            };
+            let dt_pad = format!("{:<16}", dt_raw);
+            let op_pad = format!("{:<14}", entry.operation_raw);
+            let writer_pad = format!("{:<24}", entry.writer);
+
+            // Show physical bytes when logical delta is 0 but physical rewrite occurred (e.g. OPTIMIZE).
+            let logical_net = entry.bytes_added - entry.bytes_removed;
+            let phys_net = entry.physical_bytes_added - entry.physical_bytes_removed;
+            let (display_net, is_phys_only) = if entry.num_files_added == 0
+                && entry.num_files_removed == 0
+                && (entry.physical_files_added > 0 || entry.physical_files_removed > 0)
+            {
+                (phys_net, true)
             } else {
-                Color::Yellow
-            }),
-            Cell::new("Type").fg(if self.plain {
-                Color::Reset
+                (logical_net, false)
+            };
+
+            let size_raw = if is_phys_only {
+                format!("{} (phys)", format_signed_bytes(display_net))
             } else {
-                Color::Yellow
-            }),
-            Cell::new("Nullable").fg(if self.plain {
-                Color::Reset
+                format_signed_bytes(display_net)
+            };
+            let size_pad = format!("{:<16}", size_raw);
+
+            let rows_raw = match entry.num_output_rows {
+                Some(r) => format_rows(r),
+                None => String::new(),
+            };
+
+            let ver_out = self.paint_cyan(&ver_pad);
+            let dt_out = self.paint_gray(&dt_pad);
+            let op_out = self.paint_op(&entry.operation, &op_pad);
+            let size_out = if display_net >= 0 {
+                self.paint_green(&size_pad)
             } else {
-                Color::Yellow
-            }),
-            Cell::new("Metadata").fg(if self.plain {
-                Color::Reset
+                self.paint_red(&size_pad)
+            };
+            let rows_out = if entry.num_output_rows.unwrap_or(0) >= 0 {
+                self.paint_green(&rows_raw)
             } else {
-                Color::Yellow
-            }),
-        ]);
+                self.paint_red(&rows_raw)
+            };
+
+            writeln!(
+                w,
+                "{ver_out}  {dt_out}  {op_out}  {writer_pad}  {size_out}  {rows_out}"
+            )?;
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // audit
+    // -----------------------------------------------------------------------
+
+    pub fn render_audit(&self, path: &str, entries: &[LineageEntry]) -> io::Result<()> {
+        let mut stdout = io::stdout().lock();
+        self.render_audit_to(&mut stdout, path, entries)
+    }
+
+    pub fn render_audit_to<W: Write>(
+        &self,
+        w: &mut W,
+        path: &str,
+        entries: &[LineageEntry],
+    ) -> io::Result<()> {
+        if entries.is_empty() {
+            writeln!(w, "No audit operations found matching the criteria.")?;
+            return Ok(());
+        }
+
+        if !self.no_header {
+            writeln!(
+                w,
+                "{}",
+                self.paint_cyan_bold(&format!("Audit Trail · {path}"))
+            )?;
+        }
+
+        for entry in entries {
+            let ver_pad = format!("{:<6}", format!("v{:03}", entry.version));
+            let dt_raw = match entry.timestamp {
+                Some(ts) => format_timestamp_ms(ts, "%Y-%m-%d %H:%M"),
+                None => "N/A".to_string(),
+            };
+            let dt_pad = format!("{:<16}", dt_raw);
+            let op_pad = format!("{:<14}", entry.operation_raw);
+            let writer_pad = format!("{:<20}", entry.writer);
+
+            let predicate_raw = match &entry.predicate {
+                Some(p) => format!("predicate=\"{p}\""),
+                None => String::new(),
+            };
+            let pred_pad = format!("{:<35}", predicate_raw);
+
+            let net_bytes = entry.bytes_added - entry.bytes_removed;
+            let (impact_raw, impact_sign) = match entry.num_output_rows {
+                Some(r) => (format_rows(r), r),
+                None => (format_signed_bytes(net_bytes), net_bytes),
+            };
+
+            let ver_out = self.paint_cyan(&ver_pad);
+            let dt_out = self.paint_gray(&dt_pad);
+            let op_out = self.paint_op(&entry.operation, &op_pad);
+            let pred_out = if self.use_color {
+                pred_pad.truecolor(140, 180, 250).to_string()
+            } else {
+                pred_pad
+            };
+            let impact_out = if impact_sign >= 0 {
+                self.paint_green(&impact_raw)
+            } else {
+                self.paint_red(&impact_raw)
+            };
+
+            writeln!(
+                w,
+                "{ver_out}  {dt_out}  {op_out}  {writer_pad}  {pred_out}  {impact_out}"
+            )?;
+        }
+        writeln!(w, "\n{} operations found.", entries.len())
+    }
+
+    // -----------------------------------------------------------------------
+    // schema snapshot & history
+    // -----------------------------------------------------------------------
+
+    pub fn render_schema_snapshot(&self, path: &str, snapshot: &SchemaSnapshot) -> io::Result<()> {
+        let mut stdout = io::stdout().lock();
+        self.render_schema_snapshot_to(&mut stdout, path, snapshot)
+    }
+
+    pub fn render_schema_snapshot_to<W: Write>(
+        &self,
+        w: &mut W,
+        path: &str,
+        snapshot: &SchemaSnapshot,
+    ) -> io::Result<()> {
+        if !self.no_header {
+            let title = format!("Schema at v{:03} · {path}", snapshot.version);
+            writeln!(w, "{}", self.paint_cyan_bold(&title))?;
+        }
+
+        let mut table = self.make_table();
+
+        // Proper 4-column header aligned with the 4 data columns!
+        if !self.no_header {
+            table.set_header(vec![
+                self.cell("Field Name", Some(Color::Yellow)),
+                self.cell("Type", Some(Color::Yellow)),
+                self.cell("Nullable", Some(Color::Yellow)),
+                self.cell("Metadata", Some(Color::Yellow)),
+            ]);
+        }
 
         for field in &snapshot.schema.fields {
             let nullable_str = if field.nullable { "true" } else { "false" };
-
-            let type_str = if field.data_type.is_string() {
-                field.data_type.as_str().unwrap().to_string().to_uppercase()
-            } else {
-                field.data_type.to_string()
-            };
-
+            let type_str = field.data_type.display_name();
             let meta_str = if field.metadata.is_null()
-                || (field.metadata.is_object() && field.metadata.as_object().unwrap().is_empty())
+                || field
+                    .metadata
+                    .as_object()
+                    .map(|m| m.is_empty())
+                    .unwrap_or(false)
             {
                 "-".to_string()
             } else {
                 field.metadata.to_string()
             };
 
-            table.add_row(vec![&field.name, &type_str, nullable_str, &meta_str]);
+            table.add_row(vec![
+                field.name.as_str(),
+                type_str.as_str(),
+                nullable_str,
+                meta_str.as_str(),
+            ]);
         }
 
-        println!("{table}");
+        writeln!(w, "{table}")
     }
 
-    pub fn render_schema_history(
+    pub fn render_schema_history(&self, path: &str, history: &[SchemaChange]) -> io::Result<()> {
+        let mut stdout = io::stdout().lock();
+        self.render_schema_history_to(&mut stdout, path, history)
+    }
+
+    pub fn render_schema_history_to<W: Write>(
         &self,
+        w: &mut W,
         path: &str,
-        history: &[crate::core::model::schema::SchemaChange],
-    ) {
+        history: &[SchemaChange],
+    ) -> io::Result<()> {
         if history.is_empty() {
-            println!("No schema evolution history detected.");
-            return;
+            writeln!(w, "No schema evolution history detected.")?;
+            return Ok(());
         }
 
-        if !self.plain {
-            use colored::Colorize;
-            println!("{}", format!("Schema Evolution · {}", path).cyan().bold());
-            println!();
-        } else {
-            println!("Schema Evolution · {}", path);
-            println!();
+        if !self.no_header {
+            writeln!(
+                w,
+                "{}\n",
+                self.paint_cyan_bold(&format!("Schema Evolution · {path}"))
+            )?;
         }
 
         for change in history {
             let dt_str = match change.timestamp {
-                Some(ts) => {
-                    let dt = Utc.timestamp_millis_opt(ts).unwrap();
-                    dt.format("%Y-%m-%d %H:%M").to_string()
-                }
+                Some(ts) => format_timestamp_ms(ts, "%Y-%m-%d %H:%M"),
                 None => "N/A".to_string(),
             };
-
-            if self.plain {
-                println!("v{:<3}  {}  Schema Change", change.version, dt_str);
-                for col in &change.added_columns {
-                    println!("      + added: {}", col);
-                }
-                for col in &change.removed_columns {
-                    println!("      - removed: {}", col);
-                }
-                for (name, old_t, new_t) in &change.modified_columns {
-                    println!("      ~ modified: {} ({} → {})", name, old_t, new_t);
-                }
+            let ver_str = format!("v{:03}", change.version);
+            let header_label = if change.has_breaking_changes {
+                "Schema Change [BREAKING]"
             } else {
-                use colored::Colorize;
-                let version_styled = format!("v{:03}", change.version).cyan();
-                let dt_styled = dt_str.truecolor(128, 128, 128); // gray
+                "Schema Change"
+            };
 
-                println!("{}  {}  Schema Change", version_styled, dt_styled);
-                for col in &change.added_columns {
-                    println!("      {}", format!("+ added: {}", col).green());
+            writeln!(
+                w,
+                "{}  {}  {}",
+                self.paint_cyan(&ver_str),
+                self.paint_gray(&dt_str),
+                if change.has_breaking_changes {
+                    self.paint_red(header_label)
+                } else {
+                    header_label.to_string()
                 }
-                for col in &change.removed_columns {
-                    println!("      {}", format!("- removed: {}", col).red());
-                }
-                for (name, old_t, new_t) in &change.modified_columns {
-                    println!(
-                        "      {}",
-                        format!("~ modified: {} ({} → {})", name, old_t, new_t).yellow()
-                    );
-                }
+            )?;
+
+            for col in &change.added_columns {
+                let line = format!("+ added: {col}");
+                writeln!(w, "      {}", self.paint_green(&line))?;
+            }
+            for col in &change.removed_columns {
+                let line = format!("- removed [BREAKING]: {col}");
+                writeln!(w, "      {}", self.paint_red(&line))?;
+            }
+            for ren in &change.renamed_columns {
+                let line = format!("→ renamed [BREAKING]: {} → {}", ren.old_name, ren.new_name);
+                writeln!(w, "      {}", self.paint_yellow(&line))?;
+            }
+            for m in &change.modified_columns {
+                let tag = if m.breaking {
+                    "~ modified [BREAKING]"
+                } else {
+                    "~ widened"
+                };
+                let line = format!("{tag}: {} ({} → {})", m.name, m.old_type, m.new_type);
+                let painted = if m.breaking {
+                    self.paint_red(&line)
+                } else {
+                    self.paint_yellow(&line)
+                };
+                writeln!(w, "      {painted}")?;
+            }
+            for n in &change.nullability_changes {
+                let tag = if n.breaking {
+                    "~ nullable [BREAKING]"
+                } else {
+                    "~ nullable"
+                };
+                let line = format!(
+                    "{tag}: {} ({} → {})",
+                    n.name, n.old_nullable, n.new_nullable
+                );
+                let painted = if n.breaking {
+                    self.paint_red(&line)
+                } else {
+                    self.paint_yellow(&line)
+                };
+                writeln!(w, "      {painted}")?;
             }
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::model::schema::{DataType, StructField, StructType};
+    use crate::core::model::stats::{MaintenanceInfo, TableHealth, TombstoneInfo};
+
+    fn sample_stats() -> TableStats {
+        TableStats {
+            current_version: 142,
+            created_timestamp: Some(i64::MAX), // invalid timestamp must NOT panic!
+            last_modified_timestamp: Some(1_700_000_000_000),
+            min_reader_version: 3,
+            min_writer_version: 7,
+            reader_features: vec!["deletionVectors".to_string()],
+            writer_features: vec!["deletionVectors".to_string()],
+            partition_columns: vec![],
+            partition_count: 0,
+            empty_partition_count: 0,
+            schema_column_count: 2,
+            schema_change_count: 1,
+            health: TableHealth {
+                total_files: 10,
+                total_size: 10_000,
+                avg_file_size: 1_000,
+                min_file_size: 10,
+                max_file_size: 9_000,
+                small_file_count: 10,
+                small_file_pct: 100.0,
+                skew_score: 0.9,
+                deletion_vector_files: 1,
+                deleted_rows_in_dvs: 5,
+            },
+            tombstones: TombstoneInfo {
+                active_tombstones: 2,
+                reclaimable_bytes: 2048,
+                oldest_tombstone_timestamp: Some(1_700_000_000_000),
+            },
+            maintenance: MaintenanceInfo {
+                last_vacuum_version: Some(120),
+                last_vacuum_timestamp: Some(1_700_000_000_000),
+                last_optimize_version: Some(130),
+                last_optimize_timestamp: Some(1_700_000_000_000),
+                last_checkpoint_version: Some(140),
+                z_order_columns: vec![],
+                clustering_columns: vec!["id".to_string()],
+            },
+            warnings: vec![],
+        }
+    }
+
+    #[test]
+    fn test_plain_mode_emits_zero_ansi_and_prints_issue_count_and_utc_dates() {
+        let renderer = TableRenderer::with_options(true, false, true);
+        let mut buf = Vec::new();
+        renderer
+            .render_inspect_to(&mut buf, "./tbl", &sample_stats())
+            .unwrap();
+        let out = String::from_utf8(buf).unwrap();
+
+        assert!(
+            !out.contains('\x1b'),
+            "Plain mode must emit ZERO ANSI escape codes, got:\n{out}"
+        );
+        assert!(out.contains("2 issues detected:"));
+        assert!(out.contains("invalid timestamp"));
+        assert!(out.contains("2023-11-14 22:13:20 UTC"));
+        assert!(out.contains("(none)"));
+        assert!(out.contains("Clustering Columns"));
+    }
+
+    #[test]
+    fn test_audit_negative_byte_delta_colored_red_and_no_panic_on_min_i64() {
+        assert!(format_signed_bytes(i64::MIN).starts_with('-'));
+
+        let entry = LineageEntry {
+            version: 5,
+            timestamp: Some(i64::MIN), // invalid timestamp must not panic
+            operation: OperationType::Delete,
+            operation_raw: "DELETE".to_string(),
+            writer: "spark".to_string(),
+            num_files_added: 0,
+            num_files_removed: 1,
+            bytes_added: 0,
+            bytes_removed: 4096,
+            physical_files_added: 0,
+            physical_files_removed: 1,
+            physical_bytes_added: 0,
+            physical_bytes_removed: 4096,
+            num_output_rows: None,
+            predicate: Some("id = 1".to_string()),
+            user_name: None,
+            cluster_id: None,
+            engine_info: None,
+            has_commit_info: true,
+        };
+
+        let renderer = TableRenderer::with_options(false, false, true);
+        colored::control::set_override(true);
+        let mut buf = Vec::new();
+        renderer
+            .render_audit_to(&mut buf, "./tbl", &[entry])
+            .unwrap();
+        colored::control::unset_override();
+        let out = String::from_utf8(buf).unwrap();
+
+        // Red ANSI code (31) should be used for negative byte delta, not green (32)
+        assert!(out.contains("\x1b[31m-4.1 KB") || out.contains("\x1b[31m-4.1 kB"));
+        assert!(out.contains("invalid timestamp"));
+    }
+
+    #[test]
+    fn test_schema_snapshot_four_column_header_and_no_header() {
+        let snap = SchemaSnapshot {
+            version: 3,
+            timestamp: None,
+            schema: StructType {
+                type_name: "struct".to_string(),
+                fields: vec![StructField {
+                    name: "id".to_string(),
+                    data_type: DataType::Primitive("long".to_string()),
+                    nullable: false,
+                    metadata: serde_json::json!({}),
+                }],
+            },
+        };
+
+        let with_hdr = TableRenderer::with_options(true, false, false);
+        let mut b1 = Vec::new();
+        with_hdr
+            .render_schema_snapshot_to(&mut b1, "./tbl", &snap)
+            .unwrap();
+        let s1 = String::from_utf8(b1).unwrap();
+        assert!(s1.contains("Schema at v003"));
+        assert!(s1.contains("Field Name"));
+        assert!(s1.contains("Metadata"));
+        assert!(!s1.contains('\x1b'));
+
+        let no_hdr = TableRenderer::with_options(true, true, false);
+        let mut b2 = Vec::new();
+        no_hdr
+            .render_schema_snapshot_to(&mut b2, "./tbl", &snap)
+            .unwrap();
+        let s2 = String::from_utf8(b2).unwrap();
+        assert!(!s2.contains("Schema at v003"));
+        assert!(!s2.contains("Field Name"));
+        assert!(s2.contains("long"));
     }
 }

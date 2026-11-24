@@ -30,7 +30,7 @@ impl std::str::FromStr for OperationType {
             "VACUUM START" => OperationType::VacuumStart,
             "VACUUM END" => OperationType::VacuumEnd,
             "CREATE TABLE" | "CREATE TABLE AS SELECT" => OperationType::CreateTable,
-            "REPLACE TABLE" => OperationType::ReplaceTable,
+            "REPLACE TABLE" | "CREATE OR REPLACE TABLE" => OperationType::ReplaceTable,
             "RESTORE" => OperationType::Restore,
             other => OperationType::Other(other.to_string()),
         })
@@ -38,7 +38,6 @@ impl std::str::FromStr for OperationType {
 }
 
 impl OperationType {
-    #[allow(dead_code)]
     pub fn as_str(&self) -> &str {
         match self {
             OperationType::Write => "WRITE",
@@ -60,26 +59,40 @@ impl OperationType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LineageEntry {
     pub version: u64,
-    pub timestamp: i64,
+    pub timestamp: Option<i64>,
     pub operation: OperationType,
     pub operation_raw: String,
-    /// Human-readable writer attribution: engine/job/notebook.
+    /// Human-readable writer attribution: engine/job/notebook/user.
     pub writer: String,
+    /// Logical (`dataChange = true`) file additions.
     pub num_files_added: i64,
+    /// Logical (`dataChange = true`) file removals.
     pub num_files_removed: i64,
+    /// Logical (`dataChange = true`) bytes added.
     pub bytes_added: i64,
+    /// Logical (`dataChange = true`) bytes removed.
     pub bytes_removed: i64,
+    /// Physical (all `Add`, including `OPTIMIZE` / `dataChange = false`) file additions.
+    pub physical_files_added: i64,
+    /// Physical (all `Remove`, including `OPTIMIZE` / `dataChange = false`) file removals.
+    pub physical_files_removed: i64,
+    /// Physical bytes added.
+    pub physical_bytes_added: i64,
+    /// Physical bytes removed.
+    pub physical_bytes_removed: i64,
     pub num_output_rows: Option<i64>,
     pub predicate: Option<String>,
     pub user_name: Option<String>,
     pub cluster_id: Option<String>,
     pub engine_info: Option<String>,
+    /// False if the commit lacked a `commitInfo` action and this entry was synthesized.
+    pub has_commit_info: bool,
 }
 
 impl LineageEntry {
-    #[allow(dead_code)]
     pub fn timestamp_as_datetime(&self) -> Option<DateTime<Utc>> {
         use chrono::TimeZone;
-        Utc.timestamp_millis_opt(self.timestamp).single()
+        self.timestamp
+            .and_then(|ts| Utc.timestamp_millis_opt(ts).single())
     }
 }
