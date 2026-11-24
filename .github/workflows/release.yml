@@ -154,9 +154,15 @@ jobs:
           "$hash  $staging.zip" | Out-File -Encoding utf8 "$staging.zip.sha256"
           echo "ASSET_SHA=$staging.zip.sha256" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+      - name: Extract release notes from CHANGELOG.md
+        shell: bash
+        run: |
+          awk '/^## /{ if (found) exit; found=1 } found { print }' CHANGELOG.md > release_notes.md
+
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
+          body_path: release_notes.md
           generate_release_notes: true
           files: |
             ${{ env.ASSET }}
