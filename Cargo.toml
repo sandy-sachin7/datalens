@@ -53,7 +53,7 @@ rayon = "1"
 
 # Terminal rendering
 comfy-table = "7.0.1"
-colored = "2"
+colored = "3"
 
 # Time handling
 chrono = { version = "0.4", features = ["serde"] }
