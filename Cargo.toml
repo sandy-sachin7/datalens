@@ -2,7 +2,7 @@
 name = "deltalens"
 version = "2.0.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.88"
 description = "Standalone CLI to inspect Delta Lake tables without Spark, JVM, or Python"
 license = "MIT"
 homepage = "https://github.com/sandy-sachin7/datalens#readme"
@@ -66,12 +66,12 @@ bytesize = "1"
 
 # Parquet checkpoint reading (classic, multi-part, V2 & sidecars)
 bytes = "1"
-arrow-array = { version = "53", default-features = false }
-arrow-schema = { version = "53", default-features = false }
-parquet = { version = "53", default-features = false, features = ["arrow", "snap", "zstd", "flate2", "lz4"] }
+arrow-array = { version = "60", default-features = false }
+arrow-schema = { version = "60", default-features = false }
+parquet = { version = "60", default-features = false, features = ["arrow", "snap", "zstd", "flate2-zlib-rs", "lz4"] }
 
 # Object storage support (S3, GCS, Azure) — feature-gated
-object_store = { version = "0.11", default-features = false, optional = true }
+object_store = { version = "0.14", default-features = false, optional = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"], optional = true }
 futures = { version = "0.3", optional = true }
 

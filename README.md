@@ -6,7 +6,7 @@
 [![docs.rs](https://img.shields.io/docsrs/deltalens?style=flat-square)](https://docs.rs/deltalens)
 [![GitHub Release](https://img.shields.io/github/v/release/sandy-sachin7/datalens?style=flat-square)](https://github.com/sandy-sachin7/datalens/releases)
 [![CI](https://github.com/sandy-sachin7/datalens/actions/workflows/ci.yml/badge.svg)](https://github.com/sandy-sachin7/datalens/actions/workflows/ci.yml)
-[![MSRV: Rust 1.80+](https://img.shields.io/badge/MSRV-Rust%201.80%2B-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org)
+[![MSRV: Rust 1.88+](https://img.shields.io/badge/MSRV-Rust%201.88%2B-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
 
 Native Rust binary that reads `_delta_log/` metadata directly — including NDJSON commits, classic & multi-part Parquet checkpoints, V2 checkpoints with `_sidecars/`, `.compacted.json` files, Deletion Vectors, Column Mapping renames, and Liquid Clustering — across local disks, AWS S3, Google Cloud Storage, and Azure Data Lake.

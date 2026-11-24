@@ -412,8 +412,8 @@ fn extract_checkpoint_metadata(s: &StructArray, row: usize) -> CheckpointMetadat
 mod tests {
     use super::*;
     use arrow_array::builder::{
-        BooleanBuilder, Int32Builder, Int64Builder, ListBuilder, MapBuilder, StringBuilder,
-        StructBuilder,
+        BooleanBuilder, Int32Builder, Int64Builder, ListBuilder, MapBuilder, MapFieldNames,
+        StringBuilder, StructBuilder,
     };
     use arrow_schema::{DataType as ArrowDataType, Field, Fields, Schema};
     use parquet::arrow::ArrowWriter;
@@ -608,7 +608,11 @@ mod tests {
                 Box::new(Int64Builder::new()),
                 Box::new(BooleanBuilder::new()),
                 Box::new(MapBuilder::new(
-                    None,
+                    Some(MapFieldNames {
+                        entry: "entries".into(),
+                        key: "keys".into(),
+                        value: "values".into(),
+                    }),
                     StringBuilder::new(),
                     StringBuilder::new(),
                 )),

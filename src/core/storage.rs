@@ -22,7 +22,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 #[cfg(feature = "cloud")]
 use object_store::path::Path as ObjectStorePath;
 #[cfg(feature = "cloud")]
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 #[cfg(feature = "cloud")]
 use std::sync::{Arc, OnceLock};
 #[cfg(feature = "cloud")]

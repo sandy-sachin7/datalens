@@ -1488,7 +1488,7 @@ mod tests {
         use bytes::Bytes;
         use object_store::memory::InMemory;
         use object_store::path::Path as ObjectStorePath;
-        use object_store::ObjectStore;
+        use object_store::ObjectStoreExt;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct CountingStorage {
