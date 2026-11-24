@@ -68,7 +68,7 @@ bytesize = "1"
 bytes = "1"
 arrow-array = { version = "53", default-features = false }
 arrow-schema = { version = "53", default-features = false }
-parquet = { version = "53", default-features = false, features = ["arrow", "snap", "zstd", "flate2", "lz4"] }
+parquet = { version = "54", default-features = false, features = ["arrow", "snap", "zstd", "flate2", "lz4"] }
 
 # Object storage support (S3, GCS, Azure) — feature-gated
 object_store = { version = "0.11", default-features = false, optional = true }
