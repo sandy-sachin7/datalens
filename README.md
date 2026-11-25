@@ -300,6 +300,10 @@ cargo run --example inspect_table --locked
 
 ## Benchmarks (Measured)
 
+<p align="center">
+  <img src="assets/deltalens-poster.png" alt="DeltaLens 2.0.1 vs deltalake 1.7.0 benchmark poster showing 111.01 ms latency and 89.4 MB peak RSS on 50,000 files" width="100%" />
+</p>
+
 Measured head-to-head on Linux x86_64 (AMD Ryzen 5 5600H, 12 logical CPUs) comparing `deltalens 2.0.1` (`13.8 MB` standalone binary) against `deltalake 1.7.0` (`delta-rs` Python 3.12.16) — reporting **both** cold CLI invocations and warm in-process Python calls:
 
 | Workload | `deltalens` (cold CLI) | `deltalake` Py (cold CLI) | `deltalake` Py (warm in-process) | Peak RSS (`deltalens` vs `deltalake`) |
