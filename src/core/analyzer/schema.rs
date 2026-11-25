@@ -419,7 +419,18 @@ fn qualify(prefix: &str, field: &str) -> String {
     }
 }
 
-/// Delta Lake safe type widening rules (Protocol typeWidening).
+const MAX_DECIMAL_PRECISION: u32 = 38;
+
+/// Delta Lake safe type widening rules (Protocol `typeWidening`).
+///
+/// Matches the official Delta Protocol type-widening matrix:
+/// - `byte` -> `short`, `integer`, `long`, `double`, `decimal(p, s)` (`p - s >= 3`)
+/// - `short` -> `integer`, `long`, `double`, `decimal(p, s)` (`p - s >= 5`)
+/// - `integer` -> `long`, `double`, `decimal(p, s)` (`p - s >= 10`)
+/// - `long` -> `decimal(p, s)` (`p - s >= 19`; `long -> double` loses precision)
+/// - `float` -> `double`
+/// - `date` -> `timestamp_ntz` (`date -> timestamp` is timezone-dependent and breaking)
+/// - `decimal(p1, s1)` -> `decimal(p2, s2)` when `s2 >= s1` and `p2 - s2 >= p1 - s1`
 fn is_safe_type_widening(old: &str, new: &str) -> bool {
     let o = old.trim().to_ascii_lowercase();
     let n = new.trim().to_ascii_lowercase();
@@ -427,14 +438,27 @@ fn is_safe_type_widening(old: &str, new: &str) -> bool {
         return true;
     }
     match (o.as_str(), n.as_str()) {
-        ("byte", "short" | "integer" | "long") => true,
-        ("short", "integer" | "long") => true,
-        ("integer", "long") => true,
+        ("byte", "short" | "integer" | "long" | "double") => true,
+        ("short", "integer" | "long" | "double") => true,
+        ("integer", "long" | "double") => true,
         ("float", "double") => true,
-        ("date", "timestamp" | "timestamp_ntz") => true,
+        ("date", "timestamp_ntz") => true,
+        ("byte" | "short" | "integer" | "long", _) => {
+            let Some((p, s)) = parse_decimal(&n) else {
+                return false;
+            };
+            let min_integral_digits = match o.as_str() {
+                "byte" => 3,
+                "short" => 5,
+                "integer" => 10,
+                "long" => 19,
+                _ => return false,
+            };
+            p - s >= min_integral_digits
+        }
         _ => {
             if let (Some((p1, s1)), Some((p2, s2))) = (parse_decimal(&o), parse_decimal(&n)) {
-                s1 == s2 && p2 >= p1
+                s2 >= s1 && (p2 - s2) >= (p1 - s1)
             } else {
                 false
             }
@@ -445,7 +469,12 @@ fn is_safe_type_widening(old: &str, new: &str) -> bool {
 fn parse_decimal(s: &str) -> Option<(u32, u32)> {
     let inner = s.strip_prefix("decimal(")?.strip_suffix(')')?;
     let (p, sc) = inner.split_once(',')?;
-    Some((p.trim().parse().ok()?, sc.trim().parse().ok()?))
+    let precision: u32 = p.trim().parse().ok()?;
+    let scale: u32 = sc.trim().parse().ok()?;
+    if precision == 0 || precision > MAX_DECIMAL_PRECISION || scale > precision {
+        return None;
+    }
+    Some((precision, scale))
 }
 
 #[cfg(test)]
@@ -538,5 +567,71 @@ mod tests {
         assert!(diff.modified_columns.iter().all(|m| !m.breaking));
         assert_eq!(diff.nullability_changes.len(), 2);
         assert!(diff.nullability_changes.iter().all(|n| !n.breaking));
+    }
+
+    #[test]
+    fn test_delta_protocol_type_widening_matrix() {
+        let safe_cases = [
+            ("byte", "short"),
+            ("byte", "integer"),
+            ("byte", "long"),
+            ("byte", "double"),
+            ("short", "integer"),
+            ("short", "long"),
+            ("short", "double"),
+            ("integer", "long"),
+            ("integer", "double"),
+            ("float", "double"),
+            ("date", "timestamp_ntz"),
+            ("byte", "decimal(3,0)"),
+            ("byte", "decimal(5,2)"),
+            ("short", "decimal(5,0)"),
+            ("short", "decimal(10,5)"),
+            ("integer", "decimal(10,0)"),
+            ("integer", "decimal(12,2)"),
+            ("long", "decimal(19,0)"),
+            ("long", "decimal(22,3)"),
+            ("decimal(10,2)", "decimal(18,2)"),
+            ("decimal(10,2)", "decimal(12,4)"),
+            ("decimal(10,2)", "decimal(38,10)"),
+        ];
+        for (old, new) in safe_cases {
+            assert!(
+                is_safe_type_widening(old, new),
+                "expected {old} -> {new} to be safe per Delta typeWidening spec"
+            );
+        }
+
+        let breaking_cases = [
+            ("date", "timestamp"),
+            ("timestamp_ntz", "timestamp"),
+            ("timestamp", "timestamp_ntz"),
+            ("long", "double"),
+            ("double", "float"),
+            ("long", "integer"),
+            ("integer", "short"),
+            ("short", "byte"),
+            ("float", "decimal(10,2)"),
+            ("double", "decimal(38,10)"),
+            ("byte", "decimal(2,0)"),
+            ("byte", "decimal(4,2)"),
+            ("short", "decimal(4,0)"),
+            ("short", "decimal(6,2)"),
+            ("integer", "decimal(9,0)"),
+            ("integer", "decimal(11,2)"),
+            ("long", "decimal(18,0)"),
+            ("long", "decimal(20,2)"),
+            ("decimal(10,2)", "decimal(11,4)"),
+            ("decimal(10,2)", "decimal(12,1)"),
+            ("decimal(10,2)", "decimal(8,2)"),
+            ("decimal(10,2)", "decimal(39,2)"),
+            ("integer", "string"),
+        ];
+        for (old, new) in breaking_cases {
+            assert!(
+                !is_safe_type_widening(old, new),
+                "expected {old} -> {new} to be breaking per Delta typeWidening spec"
+            );
+        }
     }
 }

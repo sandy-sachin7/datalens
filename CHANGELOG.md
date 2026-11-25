@@ -5,6 +5,19 @@ All notable changes to **DeltaLens** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-11-25
+
+### Added
+- **Unsupported Reader Protocol Enforcement**: Added `DeltaLensError::UnsupportedProtocol`, `MAX_SUPPORTED_READER_VERSION`, `SUPPORTED_READER_FEATURES`, `ProtocolAction::validate_reader_support()`, and `TableState::validate_protocol()`. All log readers fail loudly (exit code `1`) naming the unsupported `minReaderVersion` or `readerFeatures` (such as `catalogManaged`) instead of emitting an inaccurate report.
+- **Differential Conformance Suite (`scripts/diff_test.py`)**: CI-enforced differential testing comparing `deltalens` against `deltalake` (`delta-rs`) across checkpoints, schema evolution, `DELETE`, `UPDATE`, `MERGE`, `OPTIMIZE`, `VACUUM`, nested types, column mapping, deletion vectors, and time-travel diffs.
+- **Golden Protocol & Parser Resilience Tests**: Added `tests/protocol_conformance.rs` and `tests/parser_resilience.rs` covering unsupported reader protocols, full Delta `typeWidening` CI gates, V2 JSON checkpoints with Parquet sidecars and Deletion Vectors, and adversarial parser inputs.
+- **Parser Fuzz Targets (`fuzz/`)**: Added four `cargo-fuzz` targets for commit NDJSON, Parquet checkpoints, `_last_checkpoint`, and schema JSON parsing.
+- **Cloud S3 Integration Tests (`tests/cloud_s3.rs`)**: Added live S3/MinIO end-to-end tests exercising `_last_checkpoint` offset listing, pre-checkpoint fallback, V2 checkpoints, Deletion Vectors, CLI commands, and error paths in CI.
+
+### Fixed
+- **Delta Lake Type-Widening Rules**: Corrected `is_safe_type_widening` in `src/core/analyzer/schema.rs` to match the official Delta Protocol `typeWidening` specification (`date -> timestamp` is now breaking; `byte`/`short`/`integer` to `double`, integer types to `decimal(p, s)` with sufficient integral digits, and `decimal` scale-preserving widenings are now safe).
+- **Documentation Accuracy**: Replaced the `<10ms` summary claim in `README.md` with measured latency numbers across 60-commit and 50,000-file tables.
+
 ## [2.0.1] - 2026-11-25
 
 ### Security & Compatibility

@@ -277,6 +277,14 @@ impl TableState {
         self.seen_partitions.difference(&active).count()
     }
 
+    /// Validate the materialized protocol against DeltaLens's supported reader features.
+    pub fn validate_protocol(&self) -> Result<(), crate::error::DeltaLensError> {
+        if let Some(protocol) = &self.protocol {
+            protocol.validate_reader_support()?;
+        }
+        Ok(())
+    }
+
     /// Extract Liquid Clustering columns from `domainMetadata` (`delta.clustering`).
     pub fn clustering_columns(&self) -> Vec<String> {
         let Some(dm) = self.domain_metadata.get("delta.clustering") else {

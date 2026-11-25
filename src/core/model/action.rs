@@ -153,6 +153,22 @@ pub struct MetaDataAction {
     pub created_time: Option<i64>,
 }
 
+/// Highest Delta Lake reader protocol version supported by DeltaLens.
+pub const MAX_SUPPORTED_READER_VERSION: i32 = 3;
+
+/// Delta Lake reader table features supported by DeltaLens (`minReaderVersion == 3`).
+pub const SUPPORTED_READER_FEATURES: &[&str] = &[
+    "columnMapping",
+    "deletionVectors",
+    "timestampNtz",
+    "v2Checkpoint",
+    "vacuumProtocolCheck",
+    "typeWidening",
+    "typeWidening-preview",
+    "variantType",
+    "variantType-preview",
+];
+
 /// Protocol version requirements and table features.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -163,6 +179,38 @@ pub struct ProtocolAction {
     pub reader_features: Option<Vec<String>>,
     #[serde(default)]
     pub writer_features: Option<Vec<String>>,
+}
+
+impl ProtocolAction {
+    /// Validate that DeltaLens supports this table's reader protocol version and all
+    /// declared `readerFeatures`. Fails loudly instead of producing a silent wrong report.
+    pub fn validate_reader_support(&self) -> Result<(), crate::error::DeltaLensError> {
+        if self.min_reader_version < 1 || self.min_reader_version > MAX_SUPPORTED_READER_VERSION {
+            return Err(crate::error::DeltaLensError::UnsupportedProtocol(format!(
+                "minReaderVersion {} is not supported (supported: 1..={})",
+                self.min_reader_version, MAX_SUPPORTED_READER_VERSION
+            )));
+        }
+
+        if self.min_reader_version == 3 {
+            if let Some(features) = &self.reader_features {
+                let unsupported: Vec<&str> = features
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|f| !SUPPORTED_READER_FEATURES.contains(f))
+                    .collect();
+                if !unsupported.is_empty() {
+                    return Err(crate::error::DeltaLensError::UnsupportedProtocol(format!(
+                        "unsupported reader feature(s): {} (supported: {})",
+                        unsupported.join(", "),
+                        SUPPORTED_READER_FEATURES.join(", ")
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Per-commit metadata — operation, parameters, notebook/job info.

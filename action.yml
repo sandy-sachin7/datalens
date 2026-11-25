@@ -18,7 +18,7 @@ inputs:
     required: false
     default: ""
   version:
-    description: "DeltaLens release tag to install (e.g. v2.0.1). Defaults to latest release."
+    description: "DeltaLens release tag to install (e.g. v2.1.0). Defaults to latest release."
     required: false
     default: "latest"
   write-summary:

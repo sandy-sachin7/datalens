@@ -1,4 +1,4 @@
-use crate::core::model::action::Action;
+use crate::core::model::action::{Action, ProtocolAction};
 use crate::core::parser::checkpoint::{parse_parquet_checkpoint, LastCheckpoint};
 use crate::core::parser::commit::{CommitParser, ParseWarning};
 use crate::core::storage::StorageBackend;
@@ -262,6 +262,7 @@ impl DeltaLogReader {
                 .checked_add(1)
                 .ok_or(DeltaLensError::InvalidVersionRange(v1, v2))?;
             let (entries, warnings, _) = self.read_contiguous_range(inv, start, v2, true)?;
+            validate_effective_protocol(&[], &entries)?;
             (entries, warnings)
         };
 
@@ -317,6 +318,8 @@ impl DeltaLogReader {
             }
         }
 
+        validate_effective_protocol(&checkpoint_actions, &commits)?;
+
         Ok(SnapshotLog {
             target_version: target,
             checkpoint_version,
@@ -363,6 +366,7 @@ impl DeltaLogReader {
                     files_read += delta_files;
                 }
             }
+            validate_effective_protocol(&checkpoint_actions, &commits)?;
             Ok(SnapshotLog {
                 target_version: max_v,
                 checkpoint_version: Some(ckpt_v),
@@ -456,6 +460,7 @@ impl DeltaLogReader {
         }
 
         let (entries, warnings, _) = self.read_contiguous_range(inv, start, end, true)?;
+        validate_effective_protocol(&[], &entries)?;
         Ok((entries, warnings))
     }
 
@@ -524,7 +529,9 @@ impl DeltaLogReader {
 
         let mut selected: Vec<(u64, String)> = records.into_iter().rev().take(n).collect();
         selected.reverse();
-        self.load_and_parse_commits(&selected)
+        let (entries, warnings) = self.load_and_parse_commits(&selected)?;
+        validate_effective_protocol(&[], &entries)?;
+        Ok((entries, warnings))
     }
 
     fn read_contiguous_range(
@@ -920,6 +927,29 @@ fn parse_checkpoint_filename(filename: &str) -> Option<ParsedCheckpointFile> {
     }
 
     None
+}
+
+fn validate_effective_protocol(
+    checkpoint_actions: &[Action],
+    commits: &[CommitEntry],
+) -> Result<(), DeltaLensError> {
+    let mut latest: Option<&ProtocolAction> = None;
+    for action in checkpoint_actions {
+        if let Action::Protocol(p) = action {
+            latest = Some(p);
+        }
+    }
+    for commit in commits {
+        for action in &commit.actions {
+            if let Action::Protocol(p) = action {
+                latest = Some(p);
+            }
+        }
+    }
+    if let Some(protocol) = latest {
+        protocol.validate_reader_support()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

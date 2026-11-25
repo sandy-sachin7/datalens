@@ -1,0 +1,46 @@
+[package]
+name = "deltalens-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.deltalens]
+path = ".."
+default-features = false
+
+[[bin]]
+name = "commit_ndjson"
+path = "fuzz_targets/commit_ndjson.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parquet_checkpoint"
+path = "fuzz_targets/parquet_checkpoint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "last_checkpoint"
+path = "fuzz_targets/last_checkpoint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "schema_json"
+path = "fuzz_targets/schema_json.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

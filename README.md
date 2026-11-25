@@ -144,12 +144,12 @@ deltalens diff ./transactions --v1 10 --v2 12 --json | jq '.schema_changes[] | s
 
 ## Why Not Just Use Spark?
 
-| Approach | Cold start | Runtime required | Command |
+| Approach | Typical latency (60-commit table) | Runtime required | Command |
 | :--- | :--- | :--- | :--- |
-| Spark SQL | 10–30s | JVM + Spark cluster | `DESCRIBE HISTORY` |
-| Databricks SQL | 5–15s | Active SQL warehouse | `DESCRIBE HISTORY` |
-| delta-rs (Python) | 1–3s | Python + venv + wheels | `DeltaTable.history()` |
-| **DeltaLens** | **<10ms** | **Single binary** | `deltalens inspect` / `lineage` |
+| Spark SQL | 10–30 s (cold JVM) | JVM + Spark cluster | `DESCRIBE HISTORY` |
+| Databricks SQL | 5–15 s (cold warehouse) | Active SQL warehouse | `DESCRIBE HISTORY` |
+| delta-rs (Python) | 56.5 ms cold / 3.7 ms warm | Python + venv + wheels | `DeltaTable.history()` |
+| **DeltaLens** | **2.9 ms cold CLI** (111 ms on 50k files) | **Single binary** | `deltalens inspect` / `lineage` |
 
 DeltaLens reads only `_delta_log/` metadata (checkpoints, sidecars, compacted logs, and JSON commits) — never Parquet data files. Use **DeltaLens** for instant observability, debugging, and CI/CD quality/schema gates; use **Spark** or **delta-rs** when querying row data or running SQL joins.
 
@@ -190,7 +190,7 @@ flowchart LR
 | Liquid Clustering (`delta.clustering`) | ✅ | Extracts clustering columns from `domainMetadata` |
 | Type Widening & Recursive Schema Diff | ✅ | Nested `struct`/`array`/`map`, safe widenings vs. `[BREAKING]` |
 | Tombstone Retention (`deletedFileRetentionDuration`) | ✅ | Tracks active & expired tombstones and reclaimable bytes |
-| Protocol Features (`readerFeatures` / `writerFeatures`) | ✅ | Reported in `inspect` table & JSON output |
+| Protocol Features (`readerFeatures` / `writerFeatures`) | ✅ | Reported in `inspect`; fails loudly on unsupported `minReaderVersion` or `readerFeatures` |
 
 ---
 
@@ -326,6 +326,20 @@ For Criterion micro-benchmarks covering `read_range` and `HealthAnalyzer::analyz
 ```bash
 python3 scripts/gen_fixture.py
 cargo bench --bench log_parsing --locked
+```
+
+### Verification, Differential Testing & Fuzzing
+
+```bash
+# Differential conformance against real delta-rs tables (checkpoints, DELETE/UPDATE/MERGE/OPTIMIZE/VACUUM, nested schemas)
+cargo build --release --locked
+uv run --with deltalake --with pyarrow python3 scripts/diff_test.py
+
+# Parser fuzz targets (commit NDJSON, Parquet checkpoints, _last_checkpoint, schema JSON)
+cargo +nightly fuzz run commit_ndjson --fuzz-dir fuzz
+cargo +nightly fuzz run parquet_checkpoint --fuzz-dir fuzz
+cargo +nightly fuzz run last_checkpoint --fuzz-dir fuzz
+cargo +nightly fuzz run schema_json --fuzz-dir fuzz
 ```
 
 ---

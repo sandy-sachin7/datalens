@@ -51,4 +51,7 @@ pub enum DeltaLensError {
 
     #[error("Checkpoint error: {0}")]
     Checkpoint(String),
+
+    #[error("Unsupported Delta protocol: {0}")]
+    UnsupportedProtocol(String),
 }

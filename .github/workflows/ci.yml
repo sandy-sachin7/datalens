@@ -87,3 +87,82 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --no-deps --all-features --locked
+
+  differential:
+    name: Differential conformance (vs delta-rs)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Build deltalens
+        run: cargo build --release --locked
+
+      - name: Run delta-rs differential test suite
+        run: uv run --with deltalake --with pyarrow python3 scripts/diff_test.py
+
+  cloud-s3:
+    name: Cloud S3 integration (MinIO)
+    runs-on: ubuntu-latest
+    services:
+      minio:
+        image: minio/minio:latest
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        command: server /data
+        ports:
+          - 9000:9000
+        options: >-
+          --health-cmd "curl -sf http://localhost:9000/minio/health/live || exit 1"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Create MinIO test bucket
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://deltalens-test
+
+      - name: Run S3 integration tests
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_REGION: us-east-1
+          AWS_ENDPOINT: http://127.0.0.1:9000
+          AWS_ALLOW_HTTP: "true"
+          DELTALENS_TEST_S3_BUCKET: deltalens-test
+        run: cargo test --test cloud_s3 --locked -- --ignored --nocapture
