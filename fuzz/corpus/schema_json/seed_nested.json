@@ -1,0 +1,1 @@
+{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{}},{"name":"price","type":"decimal(10,2)","nullable":true,"metadata":{}},{"name":"tags","type":{"type":"array","elementType":"string","containsNull":true},"nullable":true,"metadata":{}}]}

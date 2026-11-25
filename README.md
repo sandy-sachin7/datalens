@@ -335,14 +335,17 @@ cargo bench --bench log_parsing --locked
 cargo build --release --locked
 uv run --with deltalake --with pyarrow python3 scripts/diff_test.py
 
+# Apache Spark conformance against official Delta Acceptance Testing (delta-incubator/dat v0.0.3: 19 tables, 29 snapshots)
+python3 scripts/dat_test.py
+
 # Cloud S3 integration test against an ephemeral local S3 HTTP server
 uv run --with "moto[server]" --with boto3 python3 scripts/run_s3_test.py
 
-# Parser fuzz targets (commit NDJSON, Parquet checkpoints, _last_checkpoint, schema JSON)
-cargo +nightly fuzz run commit_ndjson --fuzz-dir fuzz
-cargo +nightly fuzz run parquet_checkpoint --fuzz-dir fuzz
-cargo +nightly fuzz run last_checkpoint --fuzz-dir fuzz
-cargo +nightly fuzz run schema_json --fuzz-dir fuzz
+# Parser fuzz targets (commit NDJSON, Parquet checkpoints, _last_checkpoint, schema JSON; also run continuously in .github/workflows/fuzz.yml)
+cargo +nightly fuzz run commit_ndjson fuzz/corpus/commit_ndjson --fuzz-dir fuzz
+cargo +nightly fuzz run parquet_checkpoint fuzz/corpus/parquet_checkpoint --fuzz-dir fuzz
+cargo +nightly fuzz run last_checkpoint fuzz/corpus/last_checkpoint --fuzz-dir fuzz
+cargo +nightly fuzz run schema_json fuzz/corpus/schema_json --fuzz-dir fuzz
 ```
 
 ---

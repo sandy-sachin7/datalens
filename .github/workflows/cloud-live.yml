@@ -1,0 +1,40 @@
+name: Live Cloud Validation (Opt-in)
+
+on:
+  workflow_dispatch:
+    inputs:
+      table_uri:
+        description: "Live cloud Delta table URI (s3://..., gs://..., or abfss://...)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  live-cloud:
+    name: Live Cloud Read-Only Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build deltalens
+        run: cargo build --release --locked
+
+      - name: Inspect, schema, and lineage against live cloud table
+        env:
+          TABLE_URI: ${{ inputs.table_uri }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.DELTALENS_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.DELTALENS_AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.DELTALENS_AWS_REGION }}
+          GOOGLE_SERVICE_ACCOUNT_KEY: ${{ secrets.DELTALENS_GCP_SERVICE_ACCOUNT_KEY }}
+          AZURE_STORAGE_ACCOUNT_NAME: ${{ secrets.DELTALENS_AZURE_ACCOUNT_NAME }}
+          AZURE_STORAGE_ACCOUNT_KEY: ${{ secrets.DELTALENS_AZURE_ACCOUNT_KEY }}
+        run: |
+          ./target/release/deltalens inspect "$TABLE_URI" --json | python3 -c "import json,sys; d=json.load(sys.stdin); assert 'current_version' in d and d['health']['total_files'] >= 0; print('inspect ok: version', d['current_version'], 'files', d['health']['total_files'])"
+          ./target/release/deltalens schema "$TABLE_URI" --json | python3 -c "import json,sys; d=json.load(sys.stdin); assert len(d['schema']['fields']) > 0; print('schema ok:', len(d['schema']['fields']), 'columns')"
+          ./target/release/deltalens lineage "$TABLE_URI" --last 10 --json | python3 -c "import json,sys; d=json.load(sys.stdin); assert isinstance(d, list) and len(d) >= 1; print('lineage ok:', len(d), 'entries')"

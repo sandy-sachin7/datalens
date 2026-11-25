@@ -1,0 +1,71 @@
+name: Continuous Fuzzing
+
+on:
+  schedule:
+    # Weekly scheduled fuzzing run (Sundays at 04:00 UTC)
+    - cron: "0 4 * * 0"
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: "Seconds per fuzz target"
+        required: false
+        default: "60"
+  pull_request:
+    paths:
+      - "src/core/parser/**"
+      - "src/core/model/**"
+      - "src/core/replay.rs"
+      - "fuzz/**"
+      - ".github/workflows/fuzz.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: Fuzz · ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - commit_ndjson
+          - last_checkpoint
+          - parquet_checkpoint
+          - schema_json
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install nightly Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Cache fuzz build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target
+          key: fuzz-nightly-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run fuzz target (${{ matrix.target }})
+        env:
+          FUZZ_SECONDS: ${{ github.event_name == 'pull_request' && '20' || (inputs.max_total_time || '60') }}
+        run: |
+          cargo +nightly fuzz run "${{ matrix.target }}" \
+            "fuzz/corpus/${{ matrix.target }}" \
+            -- -max_total_time="${FUZZ_SECONDS}" -max_len=65536 -print_final_stats=1
+
+      - name: Upload crash artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

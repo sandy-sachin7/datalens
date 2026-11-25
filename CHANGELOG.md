@@ -5,6 +5,13 @@ All notable changes to **DeltaLens** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-11-25
+
+### Added
+- **Apache Spark DAT Conformance Suite (`scripts/dat_test.py`)**: CI-enforced validation against all 19 official Apache Spark-generated Delta Acceptance Testing (`delta-incubator/dat v0.0.3`, SHA-256 verified) tables across all 29 expected snapshots (`latest` and historical `vN` versions), including `deletion_vectors`, `column_mapping`, `timestamp_ntz`, `iceberg_compat_v1`, `stats_as_struct`, `cdf`, `check_constraints`, and `with_checkpoint`.
+- **Continuous Fuzzing CI (`.github/workflows/fuzz.yml`)**: Scheduled weekly, manual `workflow_dispatch`, and parser-PR smoke fuzzing across all 4 `cargo-fuzz` targets (`commit_ndjson`, `last_checkpoint`, `parquet_checkpoint`, `schema_json`) with checked-in seed corpora under `fuzz/corpus/` and crash artifact upload on failure.
+- **Opt-In Live Cloud Validation Workflow (`.github/workflows/cloud-live.yml`)**: Manual `workflow_dispatch` read-only `inspect`, `schema`, and `lineage` validation against real AWS S3, GCS, or Azure ADLS tables.
+
 ## [2.1.0] - 2026-11-25
 
 ### Added

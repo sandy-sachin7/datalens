@@ -116,6 +116,37 @@ jobs:
       - name: Run delta-rs differential test suite
         run: uv run --with deltalake --with pyarrow python3 scripts/diff_test.py
 
+  spark-dat:
+    name: Spark DAT conformance (delta-incubator/dat)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache Spark DAT v0.0.3 corpus
+        uses: actions/cache@v6
+        with:
+          path: .dat-cache
+          key: spark-dat-v0.0.3-19c045bc
+
+      - name: Build deltalens
+        run: cargo build --release --locked
+
+      - name: Run official Spark DAT conformance suite
+        run: python3 scripts/dat_test.py --dat-dir .dat-cache
+
   cloud-s3:
     name: Cloud S3 integration
     runs-on: ubuntu-latest
