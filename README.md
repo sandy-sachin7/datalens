@@ -4,8 +4,8 @@
 
 [![Crates.io](https://img.shields.io/crates/v/deltalens.svg?style=flat-square)](https://crates.io/crates/deltalens)
 [![docs.rs](https://img.shields.io/docsrs/deltalens?style=flat-square)](https://docs.rs/deltalens)
-[![GitHub Release](https://img.shields.io/github/v/release/sandy-sachin7/datalens?style=flat-square)](https://github.com/sandy-sachin7/datalens/releases)
-[![CI](https://github.com/sandy-sachin7/datalens/actions/workflows/ci.yml/badge.svg)](https://github.com/sandy-sachin7/datalens/actions/workflows/ci.yml)
+[![GitHub Release](https://img.shields.io/github/v/release/sandy-sachin7/deltalens?style=flat-square)](https://github.com/sandy-sachin7/deltalens/releases)
+[![CI](https://github.com/sandy-sachin7/deltalens/actions/workflows/ci.yml/badge.svg)](https://github.com/sandy-sachin7/deltalens/actions/workflows/ci.yml)
 [![MSRV: Rust 1.88+](https://img.shields.io/badge/MSRV-Rust%201.88%2B-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
 
@@ -81,13 +81,13 @@ $ deltalens diff ./transactions --v1 10 --v2 12 --plain --fail-on-breaking
 **Linux & macOS (one-liner with strict SHA-256 verification)**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sandy-sachin7/datalens/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/sandy-sachin7/deltalens/main/scripts/install.sh | bash
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-irm https://raw.githubusercontent.com/sandy-sachin7/datalens/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/sandy-sachin7/deltalens/main/scripts/install.ps1 | iex
 ```
 
 **Cargo (crates.io)**
@@ -281,9 +281,26 @@ cargo run --example inspect_table --locked
 
 ---
 
-## Benchmarks
+## Benchmarks (Measured)
 
-Reproducible Criterion benchmarks cover both full-range commit parsing (`read_range`) and checkpoint-accelerated snapshot health inspection (`read_snapshot_log` + `HealthAnalyzer::analyze_snapshot`) across small (100 commits / 1,000 adds), medium (1,000 commits / 50,000 adds), and large (5,000 commits / 500,000 adds) synthetic tables:
+Measured head-to-head on Linux x86_64 (AMD Ryzen 5 5600H, 12 logical CPUs) comparing `deltalens 2.0.1` (`13.8 MB` standalone binary) against `deltalake 1.7.0` (`delta-rs` Python 3.12.16) — reporting **both** cold CLI invocations and warm in-process Python calls:
+
+| Workload | `deltalens` (cold CLI) | `deltalake` Py (cold CLI) | `deltalake` Py (warm in-process) | Peak RSS (`deltalens` vs `deltalake`) |
+| :--- | :---: | :---: | :---: | :---: |
+| **Real 60-commit table** (Parquet checkpoints + schema evolution + `DELETE`) — `inspect` | **2.91 ms** (p95: 3.58 ms) | 56.50 ms (19.4× slower) | 3.74 ms (1.3× slower) | **12.5 MB** vs 160.9 MB |
+| **Real 60-commit table** — `lineage --last 20` / `history(20)` | **2.34 ms** (p95: 2.49 ms) | 61.04 ms (26.1× slower) | 4.45 ms (1.9× slower) | **12.6 MB** vs 221.6 MB |
+| **Real 60-commit table** — `diff --v1 0 --v2 60` | **2.60 ms** (p95: 2.85 ms) | — | — | **12.4 MB** |
+| **100 commits / 1,000 files** (full replay, no checkpoint) — `inspect` | **4.24 ms** (p95: 4.42 ms) | 90.72 ms (21.4× slower) | 16.81 ms (4.0× slower) | **12.7 MB** vs 398.4 MB |
+| **1,000 commits / 50,000 files** (full replay, no checkpoint) — `inspect` | **111.01 ms** (p95: 112.62 ms) | 397.34 ms (3.6× slower) | 285.46 ms (2.6× slower) | **89.4 MB** vs 2,048.9 MB |
+
+Reproduce on your own machine with zero permanent installs:
+
+```bash
+cargo build --release --locked
+uv run --with deltalake --with pyarrow python3 scripts/bench_compare.py
+```
+
+For Criterion micro-benchmarks covering `read_range` and `HealthAnalyzer::analyze_snapshot` up to 5,000 commits / 500,000 adds:
 
 ```bash
 python3 scripts/gen_fixture.py

@@ -13,7 +13,7 @@ If you discover a security vulnerability (such as path traversal, symlink/repars
 
 Instead, report it privately via **GitHub Private Vulnerability Reporting**:
 
-- https://github.com/sandy-sachin7/datalens/security/advisories/new
+- https://github.com/sandy-sachin7/deltalens/security/advisories/new
 
 ### What to Expect
 

@@ -5,13 +5,13 @@ Thanks for your interest in contributing to **DeltaLens**! We welcome contributi
 ## Quick Start
 
 ```bash
-git clone https://github.com/sandy-sachin7/datalens.git
-cd datalens
+git clone https://github.com/sandy-sachin7/deltalens.git
+cd deltalens
 cargo build --locked
 cargo test --locked
 ```
 
-> **MSRV**: Rust `1.80+`. Run `rustup update stable` if your toolchain is older.
+> **MSRV**: Rust `1.88+`. Run `rustup update stable` if your toolchain is older.
 
 ## What We Need Help With
 

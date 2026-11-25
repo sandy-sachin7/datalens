@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ============================================================================
 #  deltalens — Unix/Linux/macOS installer
-#  Usage:  curl -fsSL https://raw.githubusercontent.com/sandy-sachin7/datalens/main/scripts/install.sh | bash
+#  Usage:  curl -fsSL https://raw.githubusercontent.com/sandy-sachin7/deltalens/main/scripts/install.sh | bash
 # ============================================================================
 set -euo pipefail
 
-REPO="sandy-sachin7/datalens"
+REPO="sandy-sachin7/deltalens"
 BINARY="deltalens"
 GITHUB="https://github.com/${REPO}"
 API="https://api.github.com/repos/${REPO}"

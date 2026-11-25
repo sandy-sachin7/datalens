@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security Vulnerability (Private Advisory)
-    url: https://github.com/sandy-sachin7/datalens/security/advisories/new
+    url: https://github.com/sandy-sachin7/deltalens/security/advisories/new
     about: Privately report security vulnerabilities without opening a public issue
   - name: Discussion
-    url: https://github.com/sandy-sachin7/datalens/discussions
+    url: https://github.com/sandy-sachin7/deltalens/discussions
     about: Ask questions, share workflows, discuss ideas

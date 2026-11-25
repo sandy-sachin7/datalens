@@ -14,7 +14,7 @@
     Directory to install the binary. Defaults to $env:USERPROFILE\.deltalens\bin
 
 .EXAMPLE
-    irm https://raw.githubusercontent.com/sandy-sachin7/datalens/main/scripts/install.ps1 | iex
+    irm https://raw.githubusercontent.com/sandy-sachin7/deltalens/main/scripts/install.ps1 | iex
 #>
 
 [CmdletBinding()]
@@ -27,7 +27,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # ── Config ───────────────────────────────────────────────────────────────────
-$Repo      = "sandy-sachin7/datalens"
+$Repo      = "sandy-sachin7/deltalens"
 $Binary    = "deltalens"
 $GithubUrl = "https://github.com/$Repo"
 $ApiUrl    = "https://api.github.com/repos/$Repo"
