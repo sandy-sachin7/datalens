@@ -335,6 +335,9 @@ cargo bench --bench log_parsing --locked
 cargo build --release --locked
 uv run --with deltalake --with pyarrow python3 scripts/diff_test.py
 
+# Cloud S3 integration test against an ephemeral local S3 HTTP server
+uv run --with "moto[server]" --with boto3 python3 scripts/run_s3_test.py
+
 # Parser fuzz targets (commit NDJSON, Parquet checkpoints, _last_checkpoint, schema JSON)
 cargo +nightly fuzz run commit_ndjson --fuzz-dir fuzz
 cargo +nightly fuzz run parquet_checkpoint --fuzz-dir fuzz
