@@ -11,6 +11,12 @@
 
 Native Rust binary that reads `_delta_log/` metadata directly — including NDJSON commits, classic & multi-part Parquet checkpoints, V2 checkpoints with `_sidecars/`, `.compacted.json` files, Deletion Vectors, Column Mapping renames, and Liquid Clustering — across local disks, AWS S3, Google Cloud Storage, and Azure Data Lake.
 
+<p align="center">
+  <img src="assets/demo.svg" alt="DeltaLens inspect and breaking schema diff demo" width="100%" />
+</p>
+
+> **Deep dive & full benchmarks:** [Inspecting 50,000-File Delta Lake Tables in 111ms & 89MB RAM Without a JVM](https://sandy-sachin7.github.io/deltalens/)
+
 ---
 
 ## See It in Action
@@ -208,11 +214,22 @@ flowchart LR
 
 ### GitHub Actions CI/CD Gate Example
 
+Use the built-in composite action (downloads a SHA-256 verified binary and writes output to `$GITHUB_STEP_SUMMARY`):
+
 ```yaml
-- name: Gate on Delta table health & breaking schema changes
-  run: |
-    deltalens inspect s3://my-bucket/warehouse/transactions --plain --fail-on-issues
-    deltalens diff s3://my-bucket/warehouse/transactions --v1 "$PREV_VER" --v2 "$CURR_VER" --fail-on-breaking
+- name: Gate on Delta table health
+  uses: sandy-sachin7/deltalens@main
+  with:
+    command: inspect
+    path: s3://my-bucket/warehouse/transactions
+    args: --fail-on-issues
+
+- name: Gate on breaking schema changes
+  uses: sandy-sachin7/deltalens@main
+  with:
+    command: diff
+    path: s3://my-bucket/warehouse/transactions
+    args: --v1 ${{ env.PREV_VER }} --v2 ${{ env.CURR_VER }} --fail-on-breaking
 ```
 
 ---

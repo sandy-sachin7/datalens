@@ -1,0 +1,106 @@
+name: "DeltaLens CI Gate"
+description: "Inspect, diff, trace, and audit Delta Lake tables in milliseconds with strict SHA-256 binary verification and CI exit-2 gates."
+author: "sandy-sachin7"
+branding:
+  icon: "search"
+  color: "blue"
+
+inputs:
+  command:
+    description: "DeltaLens subcommand to run (inspect, diff, lineage, audit, schema)."
+    required: true
+    default: "inspect"
+  path:
+    description: "Path or cloud URI to the Delta Lake table (e.g. ./table, s3://bucket/table, gs://..., abfss://...)."
+    required: true
+  args:
+    description: "Additional flags passed to the subcommand (e.g. --fail-on-issues or --v1 10 --v2 12 --fail-on-breaking)."
+    required: false
+    default: ""
+  version:
+    description: "DeltaLens release tag to install (e.g. v2.0.1). Defaults to latest release."
+    required: false
+    default: "latest"
+  write-summary:
+    description: "Append command output to $GITHUB_STEP_SUMMARY (true/false)."
+    required: false
+    default: "true"
+
+outputs:
+  exit-code:
+    description: "Exit code returned by deltalens (0 = pass, 1 = error, 2 = CI gate triggered)."
+    value: ${{ steps.run.outputs.exit_code }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install verified deltalens binary
+      shell: bash
+      env:
+        DL_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        OS=$(uname -s)
+        ARCH=$(uname -m)
+        case "$OS" in
+          Linux)  os_slug="linux" ;;
+          Darwin) os_slug="macos" ;;
+          *) echo "::error::Unsupported OS: $OS"; exit 1 ;;
+        esac
+        case "$ARCH" in
+          x86_64|amd64)  arch_slug="x86_64" ;;
+          aarch64|arm64) arch_slug="aarch64" ;;
+          *) echo "::error::Unsupported arch: $ARCH"; exit 1 ;;
+        esac
+
+        if [ "$DL_VERSION" = "latest" ]; then
+          TAG=$(curl -fsSL "https://api.github.com/repos/sandy-sachin7/deltalens/releases/latest" | grep -m1 '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
+        else
+          TAG="$DL_VERSION"
+        fi
+
+        ASSET="deltalens-${TAG}-${arch_slug}-${os_slug}.tar.gz"
+        BASE_URL="https://github.com/sandy-sachin7/deltalens/releases/download/${TAG}"
+        TMP_DIR=$(mktemp -d)
+        trap 'rm -rf "$TMP_DIR"' EXIT
+
+        curl -fsSL "${BASE_URL}/${ASSET}" -o "${TMP_DIR}/${ASSET}"
+        curl -fsSL "${BASE_URL}/${ASSET}.sha256" -o "${TMP_DIR}/${ASSET}.sha256"
+
+        (cd "$TMP_DIR" && if command -v sha256sum >/dev/null 2>&1; then sha256sum -c "${ASSET}.sha256"; else shasum -a 256 -c "${ASSET}.sha256"; fi)
+
+        INSTALL_DIR="${RUNNER_TEMP}/deltalens-bin"
+        mkdir -p "$INSTALL_DIR"
+        tar -xzf "${TMP_DIR}/${ASSET}" -C "$INSTALL_DIR"
+        chmod +x "${INSTALL_DIR}/deltalens"
+        echo "$INSTALL_DIR" >> "$GITHUB_PATH"
+
+    - name: Run deltalens
+      id: run
+      shell: bash
+      env:
+        DL_CMD: ${{ inputs.command }}
+        DL_PATH: ${{ inputs.path }}
+        DL_ARGS: ${{ inputs.args }}
+        DL_SUMMARY: ${{ inputs.write-summary }}
+      run: |
+        set +e
+        # shellcheck disable=SC2086
+        OUTPUT=$(deltalens "$DL_CMD" "$DL_PATH" --plain $DL_ARGS 2>&1)
+        STATUS=$?
+        set -e
+
+        echo "$OUTPUT"
+        echo "exit_code=${STATUS}" >> "$GITHUB_OUTPUT"
+
+        if [ "$DL_SUMMARY" = "true" ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+          {
+            echo "### DeltaLens \`${DL_CMD}\` — \`${DL_PATH}\`"
+            echo ""
+            echo '```text'
+            echo "$OUTPUT"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+        exit "$STATUS"

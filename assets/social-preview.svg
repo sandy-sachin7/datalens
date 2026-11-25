@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640">
+  <defs>
+    <linearGradient id="cardbg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0f19"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#34d399"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1280" height="640" fill="url(#cardbg)"/>
+  <rect x="0" y="0" width="1280" height="6" fill="url(#accent)"/>
+
+  <!-- Top badge -->
+  <rect x="72" y="64" width="350" height="36" rx="18" fill="#0f2942" stroke="#38bdf8" stroke-width="1.5"/>
+  <text x="247" y="88" text-anchor="middle" font-family="sans-serif" font-size="16" font-weight="700" fill="#7dd3fc">RUST CLI · ZERO SPARK · ZERO JVM</text>
+
+  <!-- Title -->
+  <text x="72" y="176" font-family="sans-serif" font-size="82" font-weight="800" fill="#f8fafc">DeltaLens</text>
+  <text x="72" y="232" font-family="sans-serif" font-size="30" fill="#cbd5e1">Inspect, diff, trace, and audit Delta Lake tables in milliseconds.</text>
+  <text x="72" y="274" font-family="sans-serif" font-size="22" fill="#94a3b8">Local · AWS S3 · Google Cloud Storage · Azure ADLS · V2 Checkpoints · Deletion Vectors</text>
+
+  <!-- Metric cards -->
+  <rect x="72" y="332" width="356" height="170" rx="14" fill="#161f30" stroke="#263248" stroke-width="1.5"/>
+  <text x="100" y="376" font-family="sans-serif" font-size="18" font-weight="600" fill="#94a3b8">REAL 60-COMMIT TABLE</text>
+  <text x="100" y="438" font-family="monospace" font-size="52" font-weight="800" fill="#34d399">2.91 ms</text>
+  <text x="100" y="476" font-family="sans-serif" font-size="18" fill="#cbd5e1">19.4x faster than cold delta-rs Py</text>
+
+  <rect x="462" y="332" width="356" height="170" rx="14" fill="#161f30" stroke="#263248" stroke-width="1.5"/>
+  <text x="490" y="376" font-family="sans-serif" font-size="18" font-weight="600" fill="#94a3b8">50,000-FILE FULL REPLAY</text>
+  <text x="490" y="438" font-family="monospace" font-size="52" font-weight="800" fill="#38bdf8">111 ms</text>
+  <text x="490" y="476" font-family="sans-serif" font-size="18" fill="#cbd5e1">89 MB RAM vs 2.05 GB (22.9x less)</text>
+
+  <rect x="852" y="332" width="356" height="170" rx="14" fill="#161f30" stroke="#263248" stroke-width="1.5"/>
+  <text x="880" y="376" font-family="sans-serif" font-size="18" font-weight="600" fill="#94a3b8">CI SCHEMA &amp; HEALTH GATE</text>
+  <text x="880" y="438" font-family="monospace" font-size="52" font-weight="800" fill="#fbbf24">exit 2</text>
+  <text x="880" y="476" font-family="sans-serif" font-size="18" fill="#cbd5e1">Breaking schema diff + skew checks</text>
+
+  <!-- Bottom install strip -->
+  <rect x="72" y="542" width="1136" height="56" rx="10" fill="#0d1320" stroke="#30363d" stroke-width="1.5"/>
+  <text x="100" y="577" font-family="monospace" font-size="22" fill="#38bdf8">$ <tspan fill="#f8fafc">cargo install deltalens</tspan><tspan fill="#64748b">   |   </tspan><tspan fill="#34d399">github.com/sandy-sachin7/deltalens</tspan></text>
+</svg>

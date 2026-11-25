@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Inspecting 50,000-File Delta Lake Tables in 111ms &amp; 89MB RAM Without a JVM — DeltaLens</title>
+  <meta name="description" content="How DeltaLens parses Delta Lake NDJSON logs, Parquet checkpoints, V2 sidecars, and Deletion Vectors in milliseconds from a single 13.8 MB Rust binary." />
+  <meta property="og:title" content="Inspecting 50,000-File Delta Lake Tables in 111ms &amp; 89MB RAM Without a JVM" />
+  <meta property="og:description" content="Standalone Rust CLI to inspect, diff, trace, and audit Delta Lake tables — 2.91ms cold CLI vs 56.5ms delta-rs Python, 22.9x less RAM at 50k files." />
+  <meta property="og:type" content="article" />
+  <meta property="og:url" content="https://sandy-sachin7.github.io/deltalens/" />
+  <meta property="og:image" content="https://raw.githubusercontent.com/sandy-sachin7/deltalens/main/assets/social-preview.png" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --surface: #131a29;
+      --border: #253047;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --green: #34d399;
+      --amber: #fbbf24;
+      --code-bg: #0f172a;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #ffffff;
+        --surface: #f8fafc;
+        --border: #e2e8f0;
+        --text: #0f172a;
+        --muted: #475569;
+        --accent: #0284c7;
+        --green: #059669;
+        --amber: #d97706;
+        --code-bg: #f1f5f9;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.68;
+      font-size: 17px;
+    }
+    main {
+      max-width: 820px;
+      margin: 0 auto;
+      padding: 48px 20px 80px;
+    }
+    nav {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 36px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--border);
+      font-size: 14px;
+    }
+    nav a { color: var(--accent); text-decoration: none; font-weight: 600; margin-left: 16px; }
+    nav a:first-child { margin-left: 0; font-size: 16px; color: var(--text); }
+    h1 { font-size: 2.15rem; line-height: 1.2; margin: 0 0 12px; letter-spacing: -0.02em; }
+    h2 { font-size: 1.45rem; margin: 40px 0 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+    h3 { font-size: 1.1rem; margin: 24px 0 8px; }
+    .meta { color: var(--muted); font-size: 14px; margin-bottom: 28px; }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 14px;
+      margin: 24px 0 32px;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px 18px;
+    }
+    .card .label { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+    .card .num { font-size: 1.8rem; font-weight: 800; font-family: ui-monospace, Menlo, monospace; margin: 4px 0; color: var(--green); }
+    .card .sub { font-size: 13px; color: var(--muted); }
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      overflow-x: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13.5px;
+      line-height: 1.5;
+    }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.9em;
+      background: var(--code-bg);
+      padding: 2px 5px;
+      border-radius: 4px;
+    }
+    pre code { background: none; padding: 0; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 20px 0;
+      font-size: 14.5px;
+    }
+    th, td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+    }
+    th { background: var(--surface); font-weight: 700; }
+    .numcol { text-align: right; font-family: ui-monospace, Menlo, monospace; }
+    .highlight { color: var(--green); font-weight: 700; }
+    .bar-wrap { margin: 24px 0; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px; }
+    .bar-row { margin: 12px 0; }
+    .bar-label { display: flex; justify-content: space-between; font-size: 13.5px; margin-bottom: 5px; }
+    .bar-track { height: 12px; background: var(--code-bg); border-radius: 6px; overflow: hidden; }
+    .bar-fill { height: 100%; border-radius: 6px; }
+    a { color: var(--accent); }
+    .cta {
+      margin-top: 40px;
+      padding: 22px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+  </style>
+</head>
+<body>
+<main>
+  <nav>
+    <a href="https://github.com/sandy-sachin7/deltalens">DeltaLens</a>
+    <div>
+      <a href="https://github.com/sandy-sachin7/deltalens">GitHub</a>
+      <a href="https://crates.io/crates/deltalens">Crates.io</a>
+      <a href="https://docs.rs/deltalens">docs.rs</a>
+    </div>
+  </nav>
+
+  <h1>Inspecting 50,000-File Delta Lake Tables in 111ms &amp; 89MB RAM Without a JVM</h1>
+  <div class="meta">Engineering notes &amp; reproducible benchmarks for <strong>deltalens v2.0.1</strong> (MIT · Rust)</div>
+
+  <p>
+    Every data engineer working with Delta Lake has hit the same papercut: you just want to know
+    whether a table has a small-file problem, how much storage is sitting in expired tombstones,
+    who ran the last <code>MERGE</code>, or whether a PR introduced a breaking schema change —
+    and your choices are booting a 15-second Spark session, paying for a Databricks SQL warehouse,
+    or wrangling a Python virtualenv with <code>deltalake</code>.
+  </p>
+  <p>
+    <strong>DeltaLens</strong> is a standalone, strictly read-only Rust CLI &amp; library (<code>13.8 MB</code>)
+    that reads only <code>_delta_log/</code> metadata — NDJSON commits, classic &amp; multi-part Parquet checkpoints,
+    V2 checkpoints with <code>_sidecars/</code>, <code>.compacted.json</code> logs, Deletion Vectors, Column Mapping,
+    and Liquid Clustering — across local disks, S3, GCS, and Azure ADLS.
+  </p>
+
+  <div class="cards">
+    <div class="card">
+      <div class="label">Real 60-Commit Table</div>
+      <div class="num">2.91 ms</div>
+      <div class="sub">Cold CLI · 19.4× faster than cold <code>deltalake</code> Py</div>
+    </div>
+    <div class="card">
+      <div class="label">50,000-File Full Replay</div>
+      <div class="num">111.0 ms</div>
+      <div class="sub">89.4 MB peak RSS vs 2,048.9 MB (22.9× less RAM)</div>
+    </div>
+    <div class="card">
+      <div class="label">CI Breaking-Schema Gate</div>
+      <div class="num">exit 2</div>
+      <div class="sub">Recursive struct/array/map diff + Column Mapping renames</div>
+    </div>
+  </div>
+
+  <h2>Measured Head-to-Head Benchmarks</h2>
+  <p>
+    All numbers below were measured on Linux x86_64 (AMD Ryzen 5 5600H, 12 logical CPUs) comparing
+    <code>deltalens 2.0.1</code> against <code>deltalake 1.7.0</code> (<code>delta-rs</code> Python 3.12.16).
+    To avoid unfair "Python startup only" comparisons, the table reports <strong>both</strong> cold CLI invocations
+    and warm in-process Python calls.
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Workload</th>
+        <th class="numcol">deltalens (cold)</th>
+        <th class="numcol">deltalake (cold)</th>
+        <th class="numcol">deltalake (warm)</th>
+        <th class="numcol">Peak RSS</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Real 60-commit table</strong> (Parquet checkpoints + schema evolution + <code>DELETE</code>) — <code>inspect</code></td>
+        <td class="numcol highlight">2.91 ms</td>
+        <td class="numcol">56.50 ms</td>
+        <td class="numcol">3.74 ms</td>
+        <td class="numcol"><strong>12.5 MB</strong> vs 160.9 MB</td>
+      </tr>
+      <tr>
+        <td><strong>Real 60-commit table</strong> — <code>lineage --last 20</code> / <code>history(20)</code></td>
+        <td class="numcol highlight">2.34 ms</td>
+        <td class="numcol">61.04 ms</td>
+        <td class="numcol">4.45 ms</td>
+        <td class="numcol"><strong>12.6 MB</strong> vs 221.6 MB</td>
+      </tr>
+      <tr>
+        <td><strong>Real 60-commit table</strong> — <code>diff --v1 0 --v2 60</code></td>
+        <td class="numcol highlight">2.60 ms</td>
+        <td class="numcol">—</td>
+        <td class="numcol">—</td>
+        <td class="numcol"><strong>12.4 MB</strong></td>
+      </tr>
+      <tr>
+        <td><strong>100 commits / 1,000 files</strong> (full replay, no checkpoint) — <code>inspect</code></td>
+        <td class="numcol highlight">4.24 ms</td>
+        <td class="numcol">90.72 ms</td>
+        <td class="numcol">16.81 ms</td>
+        <td class="numcol"><strong>12.7 MB</strong> vs 398.4 MB</td>
+      </tr>
+      <tr>
+        <td><strong>1,000 commits / 50,000 files</strong> (full replay, no checkpoint) — <code>inspect</code></td>
+        <td class="numcol highlight">111.01 ms</td>
+        <td class="numcol">397.34 ms</td>
+        <td class="numcol">285.46 ms</td>
+        <td class="numcol"><strong>89.4 MB</strong> vs 2,048.9 MB</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="bar-wrap">
+    <div style="font-weight:700; margin-bottom:8px;">Peak Memory Comparison — 1,000 Commits / 50,000 Files (Lower is Better)</div>
+    <div class="bar-row">
+      <div class="bar-label"><span><strong>deltalens 2.0.1</strong> (cold CLI)</span><span><strong>89.4 MB</strong></span></div>
+      <div class="bar-track"><div class="bar-fill" style="width: 4.4%; background: var(--green);"></div></div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-label"><span>deltalake 1.7.0 (Python / delta-rs)</span><span>2,048.9 MB</span></div>
+      <div class="bar-track"><div class="bar-fill" style="width: 100%; background: var(--amber);"></div></div>
+    </div>
+  </div>
+
+  <p>Reproduce locally with zero permanent installs using <code>uv</code>:</p>
+  <pre><code>git clone https://github.com/sandy-sachin7/deltalens.git
+cd deltalens
+cargo build --release --locked
+uv run --with deltalake --with pyarrow python3 scripts/bench_compare.py</code></pre>
+
+  <h2>Four Architectural Decisions That Make It Fast (and Safe)</h2>
+
+  <h3>1. <code>_last_checkpoint</code> Offset Listing for Cloud Stores</h3>
+  <p>
+    Listing <code>_delta_log/</code> on a busy S3 table with 50,000 historical commits burns dozens of
+    paginated <code>ListObjectsV2</code> calls before you even read a byte. For snapshot and diff queries,
+    DeltaLens reads <code>_delta_log/_last_checkpoint</code> first and invokes
+    <code>object_store::ObjectStore::list_with_offset</code> starting at <code>{V:020}</code> — collapsing
+    dozens of listing pages into one, with automatic fallback to a full single-pass inventory when inspecting
+    pre-checkpoint history or stale hints.
+  </p>
+
+  <h3>2. Strict I/O vs. CPU Concurrency Split (Zero Nested Tokio Runtimes)</h3>
+  <p>
+    Cloud object fetches run over a shared process-wide Tokio runtime using
+    <code>futures::stream::buffer_unordered(32)</code>. Once raw bytes are in memory, NDJSON commit
+    and Arrow/Parquet checkpoint parsing fans out across Rayon worker threads. Rayon workers never enter
+    <code>rt.block_on(...)</code>, eliminating runtime starvation and deadlock classes.
+  </p>
+
+  <h3>3. Unified <code>Remove</code>-Before-<code>Add</code> Replay State Machine</h3>
+  <p>
+    Operations like <code>RESTORE</code> and Deletion Vector updates emit both a <code>remove</code> and an
+    <code>add</code> for the same physical Parquet path inside a single commit. DeltaLens keys active files
+    by <code>(percent_decoded_path, deletion_vector_unique_id)</code> and executes Phase 1 (<code>Remove</code>)
+    strictly before Phase 2 (<code>Add</code>) within each commit, while tracking <code>delta.deletedFileRetentionDuration</code>
+    to compute exact reclaimable tombstone bytes.
+  </p>
+
+  <h3>4. Read-Only &amp; TOCTOU-Free Local Containment</h3>
+  <p>
+    The <code>StorageBackend</code> trait exposes no write, delete, or rename methods. On Linux/macOS,
+    <code>LocalStorage</code> pins the table root via <code>O_DIRECTORY | O_CLOEXEC</code> and walks every
+    relative component with <code>openat(..., O_NOFOLLOW)</code>. V2 checkpoint <code>_sidecars/</code>
+    references and cloud keys reject traversal segments (<code>..</code>, backslashes, NUL bytes, prefix escapes).
+  </p>
+
+  <h2>Using DeltaLens as a 5-Line GitHub Actions CI Gate</h2>
+  <pre><code>- uses: sandy-sachin7/deltalens@main
+  with:
+    command: diff
+    path: s3://my-bucket/warehouse/transactions
+    args: --v1 ${{ env.PREV_VER }} --v2 ${{ env.CURR_VER }} --fail-on-breaking</code></pre>
+  <p>
+    Breaking schema removals, renames (tracked via <code>delta.columnMapping.id</code>), narrowing type changes,
+    or nullability tightening exit with code <code>2</code> and append a Markdown report to
+    <code>$GITHUB_STEP_SUMMARY</code>.
+  </p>
+
+  <div class="cta">
+    <strong>Try it in 30 seconds:</strong>
+    <pre><code>cargo install deltalens
+# or SHA-256 verified binary (Linux/macOS):
+curl -fsSL https://raw.githubusercontent.com/sandy-sachin7/deltalens/main/scripts/install.sh | bash</code></pre>
+    <p style="margin-bottom:0;">
+      Source, architecture docs, and open contributor issues (shell completions, Prometheus export,
+      data-skipping stats analysis): <a href="https://github.com/sandy-sachin7/deltalens">github.com/sandy-sachin7/deltalens</a>
+    </p>
+  </div>
+</main>
+</body>
+</html>
