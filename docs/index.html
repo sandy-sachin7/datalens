@@ -1,312 +1,433 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="light">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Inspecting 50,000-File Delta Lake Tables in 111ms &amp; 89MB RAM Without a JVM — DeltaLens</title>
-  <meta name="description" content="How DeltaLens parses Delta Lake NDJSON logs, Parquet checkpoints, V2 sidecars, and Deletion Vectors in milliseconds from a single 13.8 MB Rust binary." />
-  <meta property="og:title" content="Inspecting 50,000-File Delta Lake Tables in 111ms &amp; 89MB RAM Without a JVM" />
-  <meta property="og:description" content="Standalone Rust CLI to inspect, diff, trace, and audit Delta Lake tables — 2.91ms cold CLI vs 56.5ms delta-rs Python, 22.9x less RAM at 50k files." />
-  <meta property="og:type" content="article" />
-  <meta property="og:url" content="https://sandy-sachin7.github.io/deltalens/" />
-  <meta property="og:image" content="https://raw.githubusercontent.com/sandy-sachin7/deltalens/main/assets/social-preview.png" />
-  <meta name="twitter:card" content="summary_large_image" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DeltaLens | Inspect 50,000-file Delta Lake tables in 111ms without a JVM</title>
+  <meta name="description" content="Standalone 13.8 MB read-only Rust CLI to inspect, diff, trace, and CI-gate Delta Lake tables directly from _delta_log/ across local disk, S3, GCS, and Azure ADLS.">
+  <link rel="canonical" href="https://sandy-sachin7.github.io/deltalens/">
+  <meta property="og:title" content="DeltaLens | Inspect 50,000-file Delta Lake tables in 111ms without a JVM">
+  <meta property="og:description" content="2.91ms cold CLI and 12.5MB RSS on real checkpointed Delta tables. 111ms and 89MB RSS on 50,000-file full replays. MIT licensed Rust binary.">
+  <meta property="og:type" content="article">
+  <meta property="og:url" content="https://sandy-sachin7.github.io/deltalens/">
+  <meta property="og:image" content="https://raw.githubusercontent.com/sandy-sachin7/deltalens/main/assets/social-preview.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400..600;1,6..72,400..500&display=swap" rel="stylesheet">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "SoftwareApplication",
+        "name": "DeltaLens",
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": "Linux, macOS, Windows",
+        "softwareVersion": "2.0.1",
+        "license": "https://opensource.org/licenses/MIT",
+        "url": "https://github.com/sandy-sachin7/deltalens",
+        "author": {
+          "@type": "Person",
+          "name": "Santhosh Sachin",
+          "url": "https://sandy-sachin7.github.io/"
+        }
+      },
+      {
+        "@type": "TechArticle",
+        "headline": "Inspecting 50,000-file Delta Lake tables in 111ms and 89MB RAM without a JVM",
+        "datePublished": "2026-11-25",
+        "dateModified": "2026-11-25",
+        "author": {
+          "@type": "Person",
+          "name": "Santhosh Sachin",
+          "url": "https://sandy-sachin7.github.io/"
+        }
+      }
+    ]
+  }
+  </script>
   <style>
     :root {
-      --bg: #0b0f19;
-      --surface: #131a29;
-      --border: #253047;
-      --text: #e2e8f0;
-      --muted: #94a3b8;
-      --accent: #38bdf8;
-      --green: #34d399;
-      --amber: #fbbf24;
-      --code-bg: #0f172a;
+      --bg: #F6F3EC;
+      --surface: #EAE4D6;
+      --surface-code: #EDE8DC;
+      --ink: #171614;
+      --muted: #4E4A42;
+      --accent: #A83316;
+      --accent-contrast: #FFFFFF;
+      --border-strong: #736C60;
+      --rule: #D3CBB9;
+      --good: #1B6B46;
+      --font-serif: "Newsreader", Georgia, "Times New Roman", serif;
+      --font-sans: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     }
-    @media (prefers-color-scheme: light) {
-      :root {
-        --bg: #ffffff;
-        --surface: #f8fafc;
-        --border: #e2e8f0;
-        --text: #0f172a;
-        --muted: #475569;
-        --accent: #0284c7;
-        --green: #059669;
-        --amber: #d97706;
-        --code-bg: #f1f5f9;
-      }
+    [data-theme="dark"] {
+      --bg: #141311;
+      --surface: #1E1C19;
+      --surface-code: #1A1815;
+      --ink: #F0ECE2;
+      --muted: #B5AEA0;
+      --accent: #F0714B;
+      --accent-contrast: #141311;
+      --border-strong: #7E776B;
+      --rule: #2F2C27;
+      --good: #58C78B;
     }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      line-height: 1.68;
-      font-size: 17px;
+    *, *::before, *::after { box-sizing: border-box; }
+    html { background: var(--bg); color: var(--ink); font-family: var(--font-sans); line-height: 1.68; scroll-behavior: smooth; }
+    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+    body { margin: 0; background: var(--bg); color: var(--ink); overflow-x: clip; }
+    a { color: var(--accent); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 0.2em; }
+    a:hover { text-decoration-thickness: 2px; }
+    button { cursor: pointer; font-family: inherit; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
+    .skip-link { position: absolute; left: -9999px; top: 0; background: var(--ink); color: var(--bg); padding: 12px 18px; font-weight: 600; z-index: 100; text-decoration: none; }
+    .skip-link:focus { left: 12px; top: 12px; }
+    .progress-bar { position: fixed; top: 0; left: 0; width: 0%; height: 3px; background: var(--accent); z-index: 50; pointer-events: none; }
+    .wrap { max-width: 860px; margin: 0 auto; padding: 0 clamp(16px, 4vw, 32px); }
+    .masthead { padding-top: clamp(18px, 3vw, 30px); }
+    .masthead-inner {
+      display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+      gap: 10px 18px; padding-bottom: 14px;
+      border-bottom: 2px solid var(--ink);
+      box-shadow: 0 4px 0 0 var(--bg), 0 5px 0 0 var(--rule);
     }
-    main {
-      max-width: 820px;
-      margin: 0 auto;
-      padding: 48px 20px 80px;
+    .brand { font-family: var(--font-serif); font-size: clamp(1.2rem, 2.2vw, 1.45rem); font-weight: 600; color: var(--ink); text-decoration: none; min-height: 44px; display: inline-flex; align-items: center; }
+    .brand:hover { color: var(--accent); text-decoration: none; }
+    .nav { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+    .nav a, .theme-toggle {
+      display: inline-flex; align-items: center; justify-content: center;
+      min-height: 44px; min-width: 44px; padding: 0 12px;
+      font-size: 0.9rem; font-weight: 500; color: var(--ink); text-decoration: none;
+      border-radius: 4px; border: 1px solid transparent; background: transparent;
     }
-    nav {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 36px;
-      padding-bottom: 16px;
-      border-bottom: 1px solid var(--border);
-      font-size: 14px;
-    }
-    nav a { color: var(--accent); text-decoration: none; font-weight: 600; margin-left: 16px; }
-    nav a:first-child { margin-left: 0; font-size: 16px; color: var(--text); }
-    h1 { font-size: 2.15rem; line-height: 1.2; margin: 0 0 12px; letter-spacing: -0.02em; }
-    h2 { font-size: 1.45rem; margin: 40px 0 12px; padding-top: 12px; border-top: 1px solid var(--border); }
-    h3 { font-size: 1.1rem; margin: 24px 0 8px; }
-    .meta { color: var(--muted); font-size: 14px; margin-bottom: 28px; }
-    .cards {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-      gap: 14px;
-      margin: 24px 0 32px;
-    }
-    .card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 16px 18px;
-    }
-    .card .label { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
-    .card .num { font-size: 1.8rem; font-weight: 800; font-family: ui-monospace, Menlo, monospace; margin: 4px 0; color: var(--green); }
-    .card .sub { font-size: 13px; color: var(--muted); }
-    pre {
-      background: var(--code-bg);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 16px;
-      overflow-x: auto;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 13.5px;
-      line-height: 1.5;
-    }
-    code {
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 0.9em;
-      background: var(--code-bg);
-      padding: 2px 5px;
-      border-radius: 4px;
-    }
-    pre code { background: none; padding: 0; }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      margin: 20px 0;
-      font-size: 14.5px;
-    }
-    th, td {
-      padding: 10px 12px;
-      border-bottom: 1px solid var(--border);
-      text-align: left;
-    }
-    th { background: var(--surface); font-weight: 700; }
-    .numcol { text-align: right; font-family: ui-monospace, Menlo, monospace; }
-    .highlight { color: var(--green); font-weight: 700; }
-    .bar-wrap { margin: 24px 0; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px; }
-    .bar-row { margin: 12px 0; }
-    .bar-label { display: flex; justify-content: space-between; font-size: 13.5px; margin-bottom: 5px; }
-    .bar-track { height: 12px; background: var(--code-bg); border-radius: 6px; overflow: hidden; }
-    .bar-fill { height: 100%; border-radius: 6px; }
-    a { color: var(--accent); }
-    .cta {
-      margin-top: 40px;
-      padding: 22px;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-    }
+    .nav a:hover, .theme-toggle:hover { background: var(--surface); text-decoration: none; }
+    .theme-toggle { border-color: var(--border-strong); font-family: var(--font-mono); font-size: 0.82rem; }
+    main { padding: clamp(28px, 5vw, 52px) 0 clamp(48px, 7vw, 84px); }
+    .hero { display: grid; grid-template-columns: 1fr; gap: 24px; padding-bottom: 32px; border-bottom: 1px solid var(--rule); }
+    @media (min-width: 780px) { .hero { grid-template-columns: minmax(0, 1.55fr) minmax(240px, 0.85fr); gap: 40px; align-items: end; } }
+    h1 { font-family: var(--font-serif); font-size: clamp(1.95rem, 4.2vw, 2.85rem); font-weight: 500; line-height: 1.12; letter-spacing: -0.025em; margin: 0 0 14px; }
+    .dek { font-size: clamp(1.02rem, 1.5vw, 1.14rem); color: var(--muted); margin: 0; }
+    .spec-box { border-top: 2px solid var(--ink); padding-top: 14px; font-size: 0.88rem; }
+    .spec-box dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 8px 14px; }
+    .spec-box dt { font-family: var(--font-mono); font-size: 0.76rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; padding-top: 2px; }
+    .spec-box dd { margin: 0; font-variant-numeric: tabular-nums; }
+    h2 { font-family: var(--font-serif); font-size: clamp(1.45rem, 2.5vw, 1.85rem); font-weight: 500; line-height: 1.24; letter-spacing: -0.015em; margin: 40px 0 14px; padding-top: 16px; border-top: 1px solid var(--rule); }
+    h3 { font-size: 1.06rem; font-weight: 600; margin: 26px 0 8px; }
+    p { margin: 0 0 16px; max-width: 68ch; }
+    code { font-family: var(--font-mono); font-size: 0.88em; background: var(--surface-code); padding: 2px 5px; border-radius: 3px; }
+    .code-block { position: relative; margin: 20px 0; }
+    pre { margin: 0; padding: 16px 76px 16px 18px; background: var(--surface-code); border: 1px solid var(--rule); border-radius: 6px; overflow-x: auto; font-family: var(--font-mono); font-size: 0.85rem; line-height: 1.55; }
+    pre code { background: transparent; padding: 0; font-size: inherit; }
+    .copy-btn { position: absolute; top: 8px; right: 8px; min-height: 36px; min-width: 60px; padding: 0 10px; background: var(--bg); color: var(--ink); border: 1px solid var(--border-strong); border-radius: 4px; font-family: var(--font-mono); font-size: 0.76rem; }
+    .copy-btn:hover { background: var(--ink); color: var(--bg); }
+    .bench-widget { margin: 26px 0; padding: 18px 20px; background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; }
+    .bench-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+    .bench-title { font-weight: 600; font-size: 0.95rem; margin: 0; }
+    .bench-tabs { display: flex; flex-wrap: wrap; gap: 6px; }
+    .bench-tab { min-height: 44px; padding: 0 12px; border: 1px solid var(--border-strong); background: var(--bg); color: var(--ink); font-family: var(--font-mono); font-size: 0.78rem; border-radius: 4px; }
+    .bench-tab[aria-pressed="true"] { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+    .bench-bars { display: grid; gap: 14px; }
+    .bench-item-head { display: flex; justify-content: space-between; gap: 12px; font-size: 0.88rem; margin-bottom: 5px; }
+    .bench-val { font-family: var(--font-mono); font-weight: 600; font-variant-numeric: tabular-nums; }
+    .bench-track { height: 12px; background: var(--bg); border: 1px solid var(--rule); border-radius: 3px; overflow: hidden; }
+    .bench-fill { height: 100%; background: var(--good); }
+    .bench-fill.is-baseline { background: var(--border-strong); }
+    .bench-footnote { margin: 14px 0 0; font-size: 0.82rem; color: var(--muted); max-width: none; }
+    .table-scroll { width: 100%; overflow-x: auto; margin: 22px 0; border: 1px solid var(--rule); border-radius: 6px; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.9rem; font-variant-numeric: tabular-nums; min-width: 540px; }
+    th, td { padding: 11px 14px; border-bottom: 1px solid var(--rule); text-align: left; }
+    tr:last-child td { border-bottom: 0; }
+    th { background: var(--surface); font-family: var(--font-mono); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.03em; color: var(--muted); }
+    .num { text-align: right; font-family: var(--font-mono); }
+    .good { color: var(--good); font-weight: 600; }
+    .install-strip { margin-top: 36px; padding: 20px 22px; background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; }
+    .site-footer { padding: 24px 0 40px; border-top: 1px solid var(--rule); font-size: 0.88rem; color: var(--muted); }
+    .footer-inner { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px 20px; }
+    .footer-links { display: flex; flex-wrap: wrap; gap: 16px; }
+    .footer-links a { color: var(--muted); min-height: 44px; display: inline-flex; align-items: center; }
+    .footer-links a:hover { color: var(--ink); }
+    .hidden { display: none !important; }
   </style>
+  <script>
+    (function(){try{var t=localStorage.getItem("sachin-theme");if(t==="dark"||t==="light"){document.documentElement.setAttribute("data-theme",t);}else if(window.matchMedia&&window.matchMedia("(prefers-color-scheme: dark)").matches){document.documentElement.setAttribute("data-theme","dark");}}catch(e){}})();
+  </script>
 </head>
 <body>
-<main>
-  <nav>
-    <a href="https://github.com/sandy-sachin7/deltalens">DeltaLens</a>
-    <div>
-      <a href="https://github.com/sandy-sachin7/deltalens">GitHub</a>
-      <a href="https://crates.io/crates/deltalens">Crates.io</a>
-      <a href="https://docs.rs/deltalens">docs.rs</a>
+  <a class="skip-link" href="#main-content">Skip to content</a>
+  <div id="reading-progress" class="progress-bar" aria-hidden="true"></div>
+  <header class="masthead">
+    <div class="wrap">
+      <div class="masthead-inner">
+        <a class="brand" href="https://sandy-sachin7.github.io/">Santhosh Sachin / DeltaLens</a>
+        <nav class="nav" aria-label="Primary">
+          <a href="https://sandy-sachin7.github.io/">Blog</a>
+          <a href="https://github.com/sandy-sachin7/deltalens">GitHub</a>
+          <a href="https://crates.io/crates/deltalens">Crates.io</a>
+          <a href="https://docs.rs/deltalens">docs.rs</a>
+          <button type="button" id="theme-toggle" class="theme-toggle" aria-pressed="false" aria-label="Switch to Lab Bench dark theme">Ink</button>
+        </nav>
+      </div>
     </div>
-  </nav>
+  </header>
 
-  <h1>Inspecting 50,000-File Delta Lake Tables in 111ms &amp; 89MB RAM Without a JVM</h1>
-  <div class="meta">Engineering notes &amp; reproducible benchmarks for <strong>deltalens v2.0.1</strong> (MIT · Rust)</div>
+  <main id="main-content" class="wrap">
+    <section class="hero" aria-label="Overview">
+      <div>
+        <h1>Inspecting 50,000-file Delta Lake tables in 111ms and 89MB RAM without a JVM</h1>
+        <p class="dek">
+          DeltaLens is a standalone 13.8 MB read-only Rust CLI and library that reads only <code>_delta_log/</code> metadata across local disks, AWS S3, Google Cloud Storage, and Azure ADLS.
+        </p>
+      </div>
+      <aside class="spec-box" aria-label="Measured summary">
+        <dl>
+          <dt>Release</dt>
+          <dd>deltalens v2.0.1 (MIT)</dd>
+          <dt>60-commit</dt>
+          <dd>2.91 ms cold CLI / 12.5 MB RSS</dd>
+          <dt>50k files</dt>
+          <dd>111.01 ms / 89.4 MB RSS</dd>
+          <dt>CI gate</dt>
+          <dd>Exit code 2 on breaking diffs</dd>
+        </dl>
+      </aside>
+    </section>
 
-  <p>
-    Every data engineer working with Delta Lake has hit the same papercut: you just want to know
-    whether a table has a small-file problem, how much storage is sitting in expired tombstones,
-    who ran the last <code>MERGE</code>, or whether a PR introduced a breaking schema change —
-    and your choices are booting a 15-second Spark session, paying for a Databricks SQL warehouse,
-    or wrangling a Python virtualenv with <code>deltalake</code>.
-  </p>
-  <p>
-    <strong>DeltaLens</strong> is a standalone, strictly read-only Rust CLI &amp; library (<code>13.8 MB</code>)
-    that reads only <code>_delta_log/</code> metadata — NDJSON commits, classic &amp; multi-part Parquet checkpoints,
-    V2 checkpoints with <code>_sidecars/</code>, <code>.compacted.json</code> logs, Deletion Vectors, Column Mapping,
-    and Liquid Clustering — across local disks, S3, GCS, and Azure ADLS.
-  </p>
+    <h2>Head-to-head benchmarks (cold and warm)</h2>
+    <p>
+      All numbers below were measured on Linux x86_64 (AMD Ryzen 5 5600H, 12 logical CPUs) comparing <code>deltalens 2.0.1</code> against <code>deltalake 1.7.0</code> (<code>delta-rs</code> Python 3.12.16). To avoid measuring only Python startup overhead, the script records both cold CLI subprocesses and warm in-process Python calls.
+    </p>
 
-  <div class="cards">
-    <div class="card">
-      <div class="label">Real 60-Commit Table</div>
-      <div class="num">2.91 ms</div>
-      <div class="sub">Cold CLI · 19.4× faster than cold <code>deltalake</code> Py</div>
+    <div class="bench-widget" data-bench-widget>
+      <div class="bench-head">
+        <p class="bench-title">Interactive view (measured on identical Delta tables)</p>
+        <div class="bench-tabs" role="group" aria-label="Switch benchmark view">
+          <button type="button" class="bench-tab" data-bench-mode="latency" aria-pressed="true">50k-File Latency</button>
+          <button type="button" class="bench-tab" data-bench-mode="memory" aria-pressed="false">50k-File Peak RSS</button>
+          <button type="button" class="bench-tab" data-bench-mode="checkpoint" aria-pressed="false">60-Commit Table</button>
+        </div>
+      </div>
+      <div class="bench-bars" data-bench-panel="latency">
+        <div>
+          <div class="bench-item-head"><span><strong>deltalens 2.0.1</strong> (cold CLI)</span><span class="bench-val">111.01 ms</span></div>
+          <div class="bench-track"><div class="bench-fill" style="width: 27.9%;"></div></div>
+        </div>
+        <div>
+          <div class="bench-item-head"><span>deltalake 1.7.0 (warm in-process)</span><span class="bench-val">285.46 ms</span></div>
+          <div class="bench-track"><div class="bench-fill is-baseline" style="width: 71.8%;"></div></div>
+        </div>
+        <div>
+          <div class="bench-item-head"><span>deltalake 1.7.0 (cold CLI)</span><span class="bench-val">397.34 ms</span></div>
+          <div class="bench-track"><div class="bench-fill is-baseline" style="width: 100%;"></div></div>
+        </div>
+      </div>
+      <div class="bench-bars hidden" data-bench-panel="memory">
+        <div>
+          <div class="bench-item-head"><span><strong>deltalens 2.0.1</strong> (cold CLI)</span><span class="bench-val">89.4 MB</span></div>
+          <div class="bench-track"><div class="bench-fill" style="width: 4.4%;"></div></div>
+        </div>
+        <div>
+          <div class="bench-item-head"><span>deltalake 1.7.0 (Python / delta-rs)</span><span class="bench-val">2,048.9 MB</span></div>
+          <div class="bench-track"><div class="bench-fill is-baseline" style="width: 100%;"></div></div>
+        </div>
+      </div>
+      <div class="bench-bars hidden" data-bench-panel="checkpoint">
+        <div>
+          <div class="bench-item-head"><span><strong>deltalens 2.0.1</strong> inspect (cold CLI)</span><span class="bench-val">2.91 ms (12.5 MB)</span></div>
+          <div class="bench-track"><div class="bench-fill" style="width: 5.2%;"></div></div>
+        </div>
+        <div>
+          <div class="bench-item-head"><span>deltalake 1.7.0 inspect (warm in-process)</span><span class="bench-val">3.74 ms</span></div>
+          <div class="bench-track"><div class="bench-fill is-baseline" style="width: 6.6%;"></div></div>
+        </div>
+        <div>
+          <div class="bench-item-head"><span>deltalake 1.7.0 inspect (cold CLI)</span><span class="bench-val">56.50 ms (160.9 MB)</span></div>
+          <div class="bench-track"><div class="bench-fill is-baseline" style="width: 100%;"></div></div>
+        </div>
+      </div>
+      <p class="bench-footnote">Lower is better. Peak RSS measured in an isolated child process so parent Arrow allocations never skew the reading.</p>
     </div>
-    <div class="card">
-      <div class="label">50,000-File Full Replay</div>
-      <div class="num">111.0 ms</div>
-      <div class="sub">89.4 MB peak RSS vs 2,048.9 MB (22.9× less RAM)</div>
-    </div>
-    <div class="card">
-      <div class="label">CI Breaking-Schema Gate</div>
-      <div class="num">exit 2</div>
-      <div class="sub">Recursive struct/array/map diff + Column Mapping renames</div>
-    </div>
-  </div>
 
-  <h2>Measured Head-to-Head Benchmarks</h2>
-  <p>
-    All numbers below were measured on Linux x86_64 (AMD Ryzen 5 5600H, 12 logical CPUs) comparing
-    <code>deltalens 2.0.1</code> against <code>deltalake 1.7.0</code> (<code>delta-rs</code> Python 3.12.16).
-    To avoid unfair "Python startup only" comparisons, the table reports <strong>both</strong> cold CLI invocations
-    and warm in-process Python calls.
-  </p>
-
-  <table>
-    <thead>
-      <tr>
-        <th>Workload</th>
-        <th class="numcol">deltalens (cold)</th>
-        <th class="numcol">deltalake (cold)</th>
-        <th class="numcol">deltalake (warm)</th>
-        <th class="numcol">Peak RSS</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td><strong>Real 60-commit table</strong> (Parquet checkpoints + schema evolution + <code>DELETE</code>) — <code>inspect</code></td>
-        <td class="numcol highlight">2.91 ms</td>
-        <td class="numcol">56.50 ms</td>
-        <td class="numcol">3.74 ms</td>
-        <td class="numcol"><strong>12.5 MB</strong> vs 160.9 MB</td>
-      </tr>
-      <tr>
-        <td><strong>Real 60-commit table</strong> — <code>lineage --last 20</code> / <code>history(20)</code></td>
-        <td class="numcol highlight">2.34 ms</td>
-        <td class="numcol">61.04 ms</td>
-        <td class="numcol">4.45 ms</td>
-        <td class="numcol"><strong>12.6 MB</strong> vs 221.6 MB</td>
-      </tr>
-      <tr>
-        <td><strong>Real 60-commit table</strong> — <code>diff --v1 0 --v2 60</code></td>
-        <td class="numcol highlight">2.60 ms</td>
-        <td class="numcol">—</td>
-        <td class="numcol">—</td>
-        <td class="numcol"><strong>12.4 MB</strong></td>
-      </tr>
-      <tr>
-        <td><strong>100 commits / 1,000 files</strong> (full replay, no checkpoint) — <code>inspect</code></td>
-        <td class="numcol highlight">4.24 ms</td>
-        <td class="numcol">90.72 ms</td>
-        <td class="numcol">16.81 ms</td>
-        <td class="numcol"><strong>12.7 MB</strong> vs 398.4 MB</td>
-      </tr>
-      <tr>
-        <td><strong>1,000 commits / 50,000 files</strong> (full replay, no checkpoint) — <code>inspect</code></td>
-        <td class="numcol highlight">111.01 ms</td>
-        <td class="numcol">397.34 ms</td>
-        <td class="numcol">285.46 ms</td>
-        <td class="numcol"><strong>89.4 MB</strong> vs 2,048.9 MB</td>
-      </tr>
-    </tbody>
-  </table>
-
-  <div class="bar-wrap">
-    <div style="font-weight:700; margin-bottom:8px;">Peak Memory Comparison — 1,000 Commits / 50,000 Files (Lower is Better)</div>
-    <div class="bar-row">
-      <div class="bar-label"><span><strong>deltalens 2.0.1</strong> (cold CLI)</span><span><strong>89.4 MB</strong></span></div>
-      <div class="bar-track"><div class="bar-fill" style="width: 4.4%; background: var(--green);"></div></div>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Workload</th>
+            <th class="num">deltalens (cold)</th>
+            <th class="num">deltalake (cold)</th>
+            <th class="num">deltalake (warm)</th>
+            <th class="num">Peak RSS</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Real 60-commit table (Parquet checkpoints, schema evolution, <code>DELETE</code>) inspect</td>
+            <td class="num good">2.91 ms</td>
+            <td class="num">56.50 ms</td>
+            <td class="num">3.74 ms</td>
+            <td class="num"><strong>12.5 MB</strong> vs 160.9 MB</td>
+          </tr>
+          <tr>
+            <td>Real 60-commit table <code>lineage --last 20</code> vs <code>history(20)</code></td>
+            <td class="num good">2.34 ms</td>
+            <td class="num">61.04 ms</td>
+            <td class="num">4.45 ms</td>
+            <td class="num"><strong>12.6 MB</strong> vs 221.6 MB</td>
+          </tr>
+          <tr>
+            <td>Real 60-commit table <code>diff --v1 0 --v2 60</code></td>
+            <td class="num good">2.60 ms</td>
+            <td class="num">n/a</td>
+            <td class="num">n/a</td>
+            <td class="num"><strong>12.4 MB</strong></td>
+          </tr>
+          <tr>
+            <td>100 commits / 1,000 files (full replay, no checkpoint)</td>
+            <td class="num good">4.24 ms</td>
+            <td class="num">90.72 ms</td>
+            <td class="num">16.81 ms</td>
+            <td class="num"><strong>12.7 MB</strong> vs 398.4 MB</td>
+          </tr>
+          <tr>
+            <td>1,000 commits / 50,000 files (full replay, no checkpoint)</td>
+            <td class="num good">111.01 ms</td>
+            <td class="num">397.34 ms</td>
+            <td class="num">285.46 ms</td>
+            <td class="num"><strong>89.4 MB</strong> vs 2,048.9 MB</td>
+          </tr>
+        </tbody>
+      </table>
     </div>
-    <div class="bar-row">
-      <div class="bar-label"><span>deltalake 1.7.0 (Python / delta-rs)</span><span>2,048.9 MB</span></div>
-      <div class="bar-track"><div class="bar-fill" style="width: 100%; background: var(--amber);"></div></div>
-    </div>
-  </div>
 
-  <p>Reproduce locally with zero permanent installs using <code>uv</code>:</p>
-  <pre><code>git clone https://github.com/sandy-sachin7/deltalens.git
+    <p>Reproduce locally with zero permanent Python installs:</p>
+    <div class="code-block">
+      <button type="button" class="copy-btn" aria-label="Copy benchmark commands">Copy</button>
+      <pre><code>git clone https://github.com/sandy-sachin7/deltalens.git
 cd deltalens
 cargo build --release --locked
 uv run --with deltalake --with pyarrow python3 scripts/bench_compare.py</code></pre>
+    </div>
 
-  <h2>Four Architectural Decisions That Make It Fast (and Safe)</h2>
+    <h2>Architecture notes</h2>
 
-  <h3>1. <code>_last_checkpoint</code> Offset Listing for Cloud Stores</h3>
-  <p>
-    Listing <code>_delta_log/</code> on a busy S3 table with 50,000 historical commits burns dozens of
-    paginated <code>ListObjectsV2</code> calls before you even read a byte. For snapshot and diff queries,
-    DeltaLens reads <code>_delta_log/_last_checkpoint</code> first and invokes
-    <code>object_store::ObjectStore::list_with_offset</code> starting at <code>{V:020}</code> — collapsing
-    dozens of listing pages into one, with automatic fallback to a full single-pass inventory when inspecting
-    pre-checkpoint history or stale hints.
-  </p>
+    <h3>1. Offset listing from _last_checkpoint on cloud stores</h3>
+    <p>
+      Listing <code>_delta_log/</code> on an S3 table with tens of thousands of commits burns dozens of paginated <code>ListObjectsV2</code> calls before parsing starts. For snapshot and diff queries, DeltaLens reads <code>_delta_log/_last_checkpoint</code> first and calls <code>object_store::ObjectStore::list_with_offset</code> starting at <code>{V:020}</code>, falling back automatically to a cached full listing when inspecting pre-checkpoint history or stale hints.
+    </p>
 
-  <h3>2. Strict I/O vs. CPU Concurrency Split (Zero Nested Tokio Runtimes)</h3>
-  <p>
-    Cloud object fetches run over a shared process-wide Tokio runtime using
-    <code>futures::stream::buffer_unordered(32)</code>. Once raw bytes are in memory, NDJSON commit
-    and Arrow/Parquet checkpoint parsing fans out across Rayon worker threads. Rayon workers never enter
-    <code>rt.block_on(...)</code>, eliminating runtime starvation and deadlock classes.
-  </p>
+    <h3>2. Separate I/O and CPU concurrency (zero nested Tokio runtimes)</h3>
+    <p>
+      Cloud object fetches run through a shared process-wide Tokio runtime using <code>futures::stream::buffer_unordered(32)</code>. Once raw bytes are in memory, NDJSON commit and Arrow Parquet checkpoint parsing fans out across Rayon worker threads. Rayon workers never enter <code>rt.block_on(...)</code>.
+    </p>
 
-  <h3>3. Unified <code>Remove</code>-Before-<code>Add</code> Replay State Machine</h3>
-  <p>
-    Operations like <code>RESTORE</code> and Deletion Vector updates emit both a <code>remove</code> and an
-    <code>add</code> for the same physical Parquet path inside a single commit. DeltaLens keys active files
-    by <code>(percent_decoded_path, deletion_vector_unique_id)</code> and executes Phase 1 (<code>Remove</code>)
-    strictly before Phase 2 (<code>Add</code>) within each commit, while tracking <code>delta.deletedFileRetentionDuration</code>
-    to compute exact reclaimable tombstone bytes.
-  </p>
+    <h3>3. Unified Remove-before-Add state machine</h3>
+    <p>
+      Operations such as <code>RESTORE</code> and Deletion Vector updates emit both a <code>remove</code> and an <code>add</code> for the same physical file in one commit. DeltaLens keys active files by <code>(percent_decoded_path, deletion_vector_unique_id)</code> and executes Phase 1 (<code>Remove</code>) before Phase 2 (<code>Add</code>) inside every commit while computing exact reclaimable tombstone bytes from <code>delta.deletedFileRetentionDuration</code>.
+    </p>
 
-  <h3>4. Read-Only &amp; TOCTOU-Free Local Containment</h3>
-  <p>
-    The <code>StorageBackend</code> trait exposes no write, delete, or rename methods. On Linux/macOS,
-    <code>LocalStorage</code> pins the table root via <code>O_DIRECTORY | O_CLOEXEC</code> and walks every
-    relative component with <code>openat(..., O_NOFOLLOW)</code>. V2 checkpoint <code>_sidecars/</code>
-    references and cloud keys reject traversal segments (<code>..</code>, backslashes, NUL bytes, prefix escapes).
-  </p>
+    <h3>4. Read-only contract and TOCTOU-free containment</h3>
+    <p>
+      <code>StorageBackend</code> exposes no write, delete, or rename methods. On Linux and macOS, <code>LocalStorage</code> pins the table root with <code>O_DIRECTORY | O_CLOEXEC</code> and traverses relative path components with <code>openat(..., O_NOFOLLOW)</code>. V2 checkpoint <code>_sidecars/</code> paths and cloud keys reject traversal segments and prefix escapes.
+    </p>
 
-  <h2>Using DeltaLens as a 5-Line GitHub Actions CI Gate</h2>
-  <pre><code>- uses: sandy-sachin7/deltalens@main
+    <h2>Five-line GitHub Actions CI gate</h2>
+    <p>
+      Breaking schema changes (removals, Column Mapping renames, narrowing type conversions, tightened nullability) exit with code <code>2</code> and append a Markdown report to <code>$GITHUB_STEP_SUMMARY</code>.
+    </p>
+    <div class="code-block">
+      <button type="button" class="copy-btn" aria-label="Copy GitHub Action YAML">Copy</button>
+      <pre><code>- uses: sandy-sachin7/deltalens@main
   with:
     command: diff
     path: s3://my-bucket/warehouse/transactions
     args: --v1 ${{ env.PREV_VER }} --v2 ${{ env.CURR_VER }} --fail-on-breaking</code></pre>
-  <p>
-    Breaking schema removals, renames (tracked via <code>delta.columnMapping.id</code>), narrowing type changes,
-    or nullability tightening exit with code <code>2</code> and append a Markdown report to
-    <code>$GITHUB_STEP_SUMMARY</code>.
-  </p>
+    </div>
 
-  <div class="cta">
-    <strong>Try it in 30 seconds:</strong>
-    <pre><code>cargo install deltalens
-# or SHA-256 verified binary (Linux/macOS):
+    <div class="install-strip">
+      <h3 style="margin-top:0;">Install DeltaLens</h3>
+      <div class="code-block">
+        <button type="button" class="copy-btn" aria-label="Copy install commands">Copy</button>
+        <pre><code>cargo install deltalens
+# Or SHA-256 verified binary (Linux / macOS):
 curl -fsSL https://raw.githubusercontent.com/sandy-sachin7/deltalens/main/scripts/install.sh | bash</code></pre>
-    <p style="margin-bottom:0;">
-      Source, architecture docs, and open contributor issues (shell completions, Prometheus export,
-      data-skipping stats analysis): <a href="https://github.com/sandy-sachin7/deltalens">github.com/sandy-sachin7/deltalens</a>
-    </p>
-  </div>
-</main>
+      </div>
+      <p style="margin-bottom:0; color: var(--muted);">
+        Open contributor issues (shell completions, Prometheus export, data-skipping stats analysis):
+        <a href="https://github.com/sandy-sachin7/deltalens/issues">github.com/sandy-sachin7/deltalens/issues</a>
+      </p>
+    </div>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap footer-inner">
+      <span>Built by <a href="https://sandy-sachin7.github.io/">Santhosh Sachin</a>. MIT licensed.</span>
+      <div class="footer-links">
+        <a href="https://sandy-sachin7.github.io/">Personal Blog</a>
+        <a href="https://github.com/sandy-sachin7/deltalens">GitHub</a>
+        <a href="https://crates.io/crates/deltalens">Crates.io</a>
+        <a href="https://docs.rs/deltalens">docs.rs</a>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    (function () {
+      var root = document.documentElement;
+      var key = "sachin-theme";
+      function apply(theme) {
+        root.setAttribute("data-theme", theme);
+        var btn = document.getElementById("theme-toggle");
+        if (btn) {
+          var dark = theme === "dark";
+          btn.setAttribute("aria-pressed", String(dark));
+          btn.textContent = dark ? "Paper" : "Ink";
+          btn.setAttribute("aria-label", dark ? "Switch to Archival Paper light theme" : "Switch to Lab Bench dark theme");
+        }
+      }
+      apply(root.getAttribute("data-theme") || "light");
+      var t = document.getElementById("theme-toggle");
+      if (t) {
+        t.addEventListener("click", function () {
+          var next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
+          try { localStorage.setItem(key, next); } catch (_) {}
+          apply(next);
+        });
+      }
+      document.querySelectorAll(".code-block").forEach(function (block) {
+        var btn = block.querySelector(".copy-btn");
+        var code = block.querySelector("pre code");
+        if (!btn || !code) return;
+        btn.addEventListener("click", function () {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(code.textContent || "").then(function () {
+              btn.textContent = "Copied";
+              setTimeout(function () { btn.textContent = "Copy"; }, 1600);
+            });
+          }
+        });
+      });
+      document.querySelectorAll("[data-bench-widget]").forEach(function (w) {
+        var tabs = w.querySelectorAll("[data-bench-mode]");
+        var panels = w.querySelectorAll("[data-bench-panel]");
+        tabs.forEach(function (tab) {
+          tab.addEventListener("click", function () {
+            var mode = tab.getAttribute("data-bench-mode");
+            tabs.forEach(function (x) { x.setAttribute("aria-pressed", String(x === tab)); });
+            panels.forEach(function (p) { p.classList.toggle("hidden", p.getAttribute("data-bench-panel") !== mode); });
+          });
+        });
+      });
+      var bar = document.getElementById("reading-progress");
+      if (bar) {
+        window.addEventListener("scroll", function () {
+          var d = document.documentElement;
+          var max = d.scrollHeight - d.clientHeight;
+          bar.style.width = (max > 0 ? Math.min(100, Math.max(0, (window.scrollY / max) * 100)) : 0).toFixed(1) + "%";
+        }, { passive: true });
+      }
+    })();
+  </script>
 </body>
 </html>
