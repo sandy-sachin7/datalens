@@ -209,7 +209,7 @@ jobs:
 
       - name: Run GCS integration tests
         env:
-          GOOGLE_SERVICE_ACCOUNT_KEY: '{"gcs_base_url":"http://127.0.0.1:14443","disable_oauth":true,"client_email":"","private_key":""}'
+          GOOGLE_SERVICE_ACCOUNT_KEY: '{"gcs_base_url":"http://127.0.0.1:14443","disable_oauth":true,"client_email":"","private_key":"","private_key_id":""}'
           DELTALENS_TEST_GCS_BUCKET: deltalens-test
         run: cargo test --test cloud_gcs --locked -- --ignored --nocapture
 
@@ -229,25 +229,28 @@ jobs:
           docker rm -f deltalens-azurite || true
           docker run -d --name deltalens-azurite -p 10000:10000 \
             mcr.microsoft.com/azure-storage/azurite azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --skipApiVersionCheck
-          for i in $(seq 1 30); do
-            if nc -z 127.0.0.1 10000; then break; fi
-            sleep 0.5
-          done
           python3 -c '
-          import base64, datetime, hashlib, hmac, urllib.request
+          import base64, datetime, hashlib, hmac, time, urllib.request
           key = base64.b64decode("Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==")
-          date = datetime.datetime.now(datetime.timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
           ver = "2020-10-02"
-          sts = f"PUT\n\n\n\n\n\n\n\n\n\n\n\nx-ms-date:{date}\nx-ms-version:{ver}\n/devstoreaccount1/deltalens-test\nrestype:container"
-          sig = base64.b64encode(hmac.new(key, sts.encode(), hashlib.sha256).digest()).decode()
-          req = urllib.request.Request(
-              "http://127.0.0.1:10000/devstoreaccount1/deltalens-test?restype=container",
-              method="PUT",
-              headers={"x-ms-date": date, "x-ms-version": ver, "Authorization": f"SharedKey devstoreaccount1:{sig}", "Content-Length": "0"},
-          )
-          with urllib.request.urlopen(req, timeout=10) as r:
-              assert r.status in (200, 201), r.status
-          print("Azurite container created")
+          for attempt in range(40):
+              date = datetime.datetime.now(datetime.timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+              sts = f"PUT\n\n\n\n\n\n\n\n\n\n\n\nx-ms-date:{date}\nx-ms-version:{ver}\n/devstoreaccount1/deltalens-test\nrestype:container"
+              sig = base64.b64encode(hmac.new(key, sts.encode(), hashlib.sha256).digest()).decode()
+              req = urllib.request.Request(
+                  "http://127.0.0.1:10000/devstoreaccount1/deltalens-test?restype=container",
+                  method="PUT",
+                  headers={"x-ms-date": date, "x-ms-version": ver, "Authorization": f"SharedKey devstoreaccount1:{sig}", "Content-Length": "0"},
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=5) as r:
+                      assert r.status in (200, 201), r.status
+                  print(f"Azurite container created on attempt {attempt + 1}")
+                  break
+              except Exception as exc:
+                  if attempt == 39:
+                      raise
+                  time.sleep(0.5)
           '
 
       - name: Install Rust toolchain
