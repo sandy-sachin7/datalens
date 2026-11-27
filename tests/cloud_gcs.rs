@@ -2,9 +2,7 @@
 
 use assert_cmd::Command;
 use deltalens::{storage_for, DeltaLogReader, DiffAnalyzer, HealthAnalyzer, TableState};
-use object_store::gcp::GoogleCloudStorageBuilder;
-use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStoreExt, PutPayload};
+use std::io::Write;
 
 #[allow(deprecated)]
 fn deltalens_cmd() -> Command {
@@ -15,10 +13,22 @@ fn gcs_bucket() -> String {
     std::env::var("DELTALENS_TEST_GCS_BUCKET").unwrap_or_else(|_| "deltalens-test".to_string())
 }
 
+fn gcs_base_url() -> String {
+    let key_json = std::env::var("GOOGLE_SERVICE_ACCOUNT_KEY")
+        .expect("GOOGLE_SERVICE_ACCOUNT_KEY must be set");
+    let v: serde_json::Value = serde_json::from_str(&key_json).expect("invalid GCS JSON key");
+    v["gcs_base_url"]
+        .as_str()
+        .expect("gcs_base_url missing in GOOGLE_SERVICE_ACCOUNT_KEY")
+        .trim_end_matches('/')
+        .to_string()
+}
+
 #[test]
 #[ignore = "requires live GCS / fake-gcs-server endpoint (GOOGLE_SERVICE_ACCOUNT_KEY with gcs_base_url & disable_oauth)"]
 fn test_gcs_inspect_diff_lineage_and_offset_listing() {
     let bucket = gcs_bucket();
+    let base_url = gcs_base_url();
     let prefix = format!(
         "ci-gcs-table-{}",
         std::time::SystemTime::now()
@@ -27,20 +37,40 @@ fn test_gcs_inspect_diff_lineage_and_offset_listing() {
             .as_millis()
     );
 
-    let store = GoogleCloudStorageBuilder::from_env()
-        .with_bucket_name(&bucket)
-        .build()
-        .expect("failed to build GCS client from env");
-
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    // Upload test fixtures via the standard GCS JSON upload API supported by fake-gcs-server.
+    // DeltaLens itself is strictly read-only and exercises object_store::gcp GET/HEAD/LIST.
     let put = |rel: &str, body: String| {
-        let key = ObjectPath::from(format!("{prefix}/{rel}"));
-        rt.block_on(async {
-            store
-                .put(&key, PutPayload::from(body.into_bytes()))
-                .await
-                .unwrap_or_else(|e| panic!("failed to upload {key}: {e}"));
-        });
+        let key = format!("{prefix}/{rel}");
+        let encoded_key = key.replace('/', "%2F");
+        let url = format!(
+            "{base_url}/upload/storage/v1/b/{bucket}/o?uploadType=media&name={encoded_key}"
+        );
+        let mut child = std::process::Command::new("curl")
+            .args([
+                "-sfS",
+                "-X",
+                "POST",
+                "-H",
+                "Content-Type: application/octet-stream",
+                "--data-binary",
+                "@-",
+                &url,
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to spawn curl for GCS fixture upload");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(body.as_bytes())
+            .expect("failed to write body to curl");
+        let status = child.wait().expect("curl wait failed");
+        assert!(
+            status.success(),
+            "failed to upload GCS fixture {key} to {url}"
+        );
     };
 
     for v in 0..=10u64 {
