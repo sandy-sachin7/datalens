@@ -5,6 +5,14 @@ All notable changes to **DeltaLens** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-11-28
+
+### Added
+- **Table Properties in `inspect --json` (`TableStats.table_properties`)**: Exposed sorted Delta table configuration properties directly in `deltalens inspect --json` for deterministic machine checks and conformance verification.
+- **Deep Apache Spark DAT Snapshot Assertions (`scripts/dat_test.py`)**: Expanded Spark DAT conformance across all 19 official Spark tables (29 snapshots, 5 multi-version diffs) to strictly assert `table_properties`, active file counts, total active bytes, partition columns, full nested schema parity against `delta-rs` and Spark `table_content/*.parquet`, exact net active row counts (`raw_parquet_rows - deleted_rows_in_dvs`), and multi-version `deltalens diff` results including `with_schema_change`.
+- **Multi-Cloud HTTP Protocol CI (`tests/cloud_gcs.rs`, `tests/cloud_azure.rs`, `.github/workflows/ci.yml`)**: Added end-to-end GCS (`gs://` via `fake-gcs-server`) and Azure (`az://` and `abfss://` via `Azurite`) integration tests alongside S3 (`Moto`), exercising V2 checkpoints, `_last_checkpoint` offset listing, time travel, schema diffs, deletion vectors, and CLI commands on every push and PR.
+- **Public Bucket & Diff Support in Live Cloud Workflow (`.github/workflows/cloud-live.yml`)**: Added `skip_signature` (anonymous public cloud tables) and optional `diff_v1` inputs to the opt-in live cloud validation workflow.
+
 ## [2.2.0] - 2026-11-25
 
 ### Added

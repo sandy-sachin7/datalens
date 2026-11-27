@@ -4,6 +4,7 @@ use crate::core::model::schema::StructType;
 use crate::core::model::stats::{MaintenanceInfo, TableHealth, TableStats};
 use crate::core::reader::{CommitEntry, SnapshotLog};
 use crate::core::replay::TableState;
+use std::collections::BTreeMap;
 
 pub struct HealthAnalyzer;
 
@@ -28,6 +29,17 @@ impl HealthAnalyzer {
         let mut maintenance = Self::compute_maintenance(&snapshot.commits);
         maintenance.last_checkpoint_version = snapshot.checkpoint_version;
         maintenance.clustering_columns = state.clustering_columns();
+
+        let table_properties: BTreeMap<String, String> = state
+            .metadata
+            .as_ref()
+            .map(|m| {
+                m.configuration
+                    .iter()
+                    .filter_map(|(k, v)| v.as_ref().map(|val| (k.clone(), val.clone())))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let partition_columns = state
             .metadata
@@ -70,6 +82,7 @@ impl HealthAnalyzer {
             min_writer_version,
             reader_features,
             writer_features,
+            table_properties,
             partition_columns,
             partition_count,
             empty_partition_count,
@@ -264,6 +277,7 @@ impl HealthAnalyzer {
             min_writer_version: 2,
             reader_features: Vec::new(),
             writer_features: Vec::new(),
+            table_properties: BTreeMap::new(),
             partition_columns: Vec::new(),
             partition_count: 0,
             empty_partition_count: 0,

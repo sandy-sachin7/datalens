@@ -938,6 +938,7 @@ mod tests {
             min_writer_version: 7,
             reader_features: vec!["deletionVectors".to_string()],
             writer_features: vec!["deletionVectors".to_string()],
+            table_properties: std::collections::BTreeMap::new(),
             partition_columns: vec![],
             partition_count: 0,
             empty_partition_count: 0,

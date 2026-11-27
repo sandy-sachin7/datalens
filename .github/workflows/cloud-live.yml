@@ -4,8 +4,18 @@ on:
   workflow_dispatch:
     inputs:
       table_uri:
-        description: "Live cloud Delta table URI (s3://..., gs://..., or abfss://...)"
+        description: "Live cloud Delta table URI (s3://..., gs://..., az://..., or abfss://...)"
         required: true
+        type: string
+      skip_signature:
+        description: "Use unsigned anonymous requests (for public S3/GCS/Azure buckets)"
+        required: false
+        default: false
+        type: boolean
+      diff_v1:
+        description: "Optional older version for `deltalens diff --v1 <diff_v1> --v2 <latest>`"
+        required: false
+        default: ""
         type: string
 
 permissions:
@@ -22,19 +32,37 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
       - name: Build deltalens
         run: cargo build --release --locked
 
-      - name: Inspect, schema, and lineage against live cloud table
+      - name: Inspect, schema, lineage, and optional diff against live cloud table
         env:
           TABLE_URI: ${{ inputs.table_uri }}
+          DIFF_V1: ${{ inputs.diff_v1 }}
+          AWS_SKIP_SIGNATURE: ${{ inputs.skip_signature && 'true' || '' }}
+          GOOGLE_SKIP_SIGNATURE: ${{ inputs.skip_signature && 'true' || '' }}
+          AZURE_SKIP_SIGNATURE: ${{ inputs.skip_signature && 'true' || '' }}
           AWS_ACCESS_KEY_ID: ${{ secrets.DELTALENS_AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.DELTALENS_AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION: ${{ secrets.DELTALENS_AWS_REGION }}
+          AWS_REGION: ${{ secrets.DELTALENS_AWS_REGION || 'us-east-1' }}
           GOOGLE_SERVICE_ACCOUNT_KEY: ${{ secrets.DELTALENS_GCP_SERVICE_ACCOUNT_KEY }}
           AZURE_STORAGE_ACCOUNT_NAME: ${{ secrets.DELTALENS_AZURE_ACCOUNT_NAME }}
           AZURE_STORAGE_ACCOUNT_KEY: ${{ secrets.DELTALENS_AZURE_ACCOUNT_KEY }}
         run: |
-          ./target/release/deltalens inspect "$TABLE_URI" --json | python3 -c "import json,sys; d=json.load(sys.stdin); assert 'current_version' in d and d['health']['total_files'] >= 0; print('inspect ok: version', d['current_version'], 'files', d['health']['total_files'])"
+          INSPECT_JSON="$(./target/release/deltalens inspect "$TABLE_URI" --json)"
+          LATEST_VER="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert "current_version" in d and "table_properties" in d and d["health"]["total_files"] >= 0; print(d["current_version"])' "$INSPECT_JSON")"
+          echo "inspect ok: version=$LATEST_VER"
           ./target/release/deltalens schema "$TABLE_URI" --json | python3 -c "import json,sys; d=json.load(sys.stdin); assert len(d['schema']['fields']) > 0; print('schema ok:', len(d['schema']['fields']), 'columns')"
           ./target/release/deltalens lineage "$TABLE_URI" --last 10 --json | python3 -c "import json,sys; d=json.load(sys.stdin); assert isinstance(d, list) and len(d) >= 1; print('lineage ok:', len(d), 'entries')"
+          if [ -n "$DIFF_V1" ]; then
+            ./target/release/deltalens diff "$TABLE_URI" --v1 "$DIFF_V1" --v2 "$LATEST_VER" --json | python3 -c "import json,sys; d=json.load(sys.stdin); print('diff ok:', d['v1'], '->', d['v2'], 'schema_changes:', len(d['schema_changes']))"
+          fi

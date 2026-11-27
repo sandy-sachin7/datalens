@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Aggregated health metrics for a Delta table's current file set.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -94,6 +95,8 @@ pub struct TableStats {
     pub min_writer_version: i32,
     pub reader_features: Vec<String>,
     pub writer_features: Vec<String>,
+    #[serde(default)]
+    pub table_properties: BTreeMap<String, String>,
     pub partition_columns: Vec<String>,
     pub partition_count: usize,
     pub empty_partition_count: usize,
